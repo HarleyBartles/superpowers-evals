@@ -24,7 +24,10 @@ import {
   transition,
   twoArmExperiment,
 } from './fixtures/core-comparison/factory.ts';
-import { singleArmComparisonFixture } from './fixtures/core-comparison/report-fixture.ts';
+import {
+  mixedComparisonFixture,
+  singleArmComparisonFixture,
+} from './fixtures/core-comparison/report-fixture.ts';
 
 const ref = (path: string, digest = '1'): ArtifactRef => ({
   path,
@@ -35,8 +38,10 @@ const ref = (path: string, digest = '1'): ArtifactRef => ({
 function reportFixture(
   update?: (evidence: AttemptEvidence[]) => void,
   resultsRoot = '/fixture/results',
+  fixture: Parameters<
+    typeof foldComparisonReport
+  >[0] = singleArmComparisonFixture(),
 ): Report {
-  const fixture = singleArmComparisonFixture();
   const evidence = [...fixture.evidenceByAttempt.values()];
   update?.(evidence);
   return ReportSchema.parse({
@@ -56,6 +61,50 @@ function reportFixture(
     },
   });
 }
+
+test('paired comparison readout exposes roles, independent quantity coverage, and elapsed accounting', () => {
+  const value = reportFixture(
+    undefined,
+    '/fixture/results',
+    mixedComparisonFixture(),
+  );
+  const comparison = value.report.comparisons[0]!;
+
+  expect(comparison.roles).toEqual({ baseline: 'b', treatment: 't1' });
+  expect(comparison.paired.wall_seconds).toEqual({
+    n: 3,
+    baseline_mean: 53.3333333333333,
+    treatment_mean: 40,
+    mean_delta: -13.3333333333333,
+  });
+  expect(comparison.paired.subject_cost_usd.n).toBe(2);
+  expect(value.report.elapsed.seconds).toBe(24);
+  expect(value.report.attempts).toHaveLength(12);
+  expect(
+    value.report.attempts.some((attempt) => !attempt.analysis_usable),
+  ).toBe(true);
+  expect(value.report.accounting.subject_cost_usd).toEqual({
+    known_subtotal: 136,
+    observed: 9,
+    attempts: 12,
+    complete: false,
+  });
+
+  const rendered = renderCampaignReport(value);
+  expect(rendered).toContain('Baseline: b; treatment: t1');
+  expect(rendered).toContain(
+    'wall_seconds: pairs 3; baseline 53.3333333333333; treatment 40; delta -13.3333333333333',
+  );
+  expect(rendered).toContain('subject_cost_usd: pairs 2');
+  expect(rendered).toContain(
+    'pass_rate: pairs 2; baseline 0.5; treatment 1; rate difference 0.5',
+  );
+  expect(rendered).toContain('Elapsed: 24 seconds');
+  expect(rendered).toContain(
+    'Analytical usability authenticates evidence but does not independently certify semantic grading.',
+  );
+  expect(rendered).toContain('9/12 partial');
+});
 
 function assessment(
   verdict: 'pass' | 'fail',
@@ -98,6 +147,7 @@ test('pass readout shows accepted grade, criterion evidence, and exact authentic
   );
 
   expect(rendered).toContain('scenario');
+  expect(rendered).toContain('Arm: base');
   expect(rendered).toContain('base');
   expect(rendered).toContain('accepted pass');
   expect(rendered).toContain('writes the requested receipt');
@@ -301,6 +351,13 @@ function multiScenarioReport(): Report {
   });
   return ReportSchema.parse(value);
 }
+
+test('comparison quantity blocks identify scenarios when roles repeat', () => {
+  const rendered = renderCampaignReport(multiScenarioReport());
+
+  expect(rendered).toContain('Scenario: conversation-pricing (c1)');
+  expect(rendered).toContain('Scenario: conversation-design (c1)');
+});
 
 test('folded multi-scenario comparison labels every attempt with its own scenario', () => {
   const report = multiScenarioReport();

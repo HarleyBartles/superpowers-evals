@@ -9,6 +9,7 @@ import {
 } from '../atif/types.ts';
 import { validateTrajectory } from '../atif/validate.ts';
 import { canonicalizeAgentPrompt } from './agent-prompt.ts';
+import type { AtifNormalizationContext } from './context.ts';
 
 // Reverse mapping: Pi tool names → canonical names.
 const PI_TOOL_MAP: Record<string, string> = {
@@ -24,6 +25,7 @@ const PI_TOOL_MAP: Record<string, string> = {
 interface PiEntry {
   type?: string;
   id?: string;
+  timestamp?: unknown;
   modelId?: string;
   provider?: string;
   message?: {
@@ -62,6 +64,11 @@ function numberOrUndefined(value: unknown): number | undefined {
     : undefined;
 }
 
+function nativeTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value === '') return undefined;
+  return Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
 /** json.dumps-style stringify for a non-string; passthrough for a string. */
 function stringify(value: unknown): string {
   if (typeof value === 'string') return value;
@@ -75,21 +82,26 @@ function stringify(value: unknown): string {
 /**
  * Map a pi `message.usage` block to ATIF step metrics + extra.
  *   input→prompt_tokens, output→completion_tokens, cacheRead→cached_tokens,
- *   cost.total→cost_usd; cacheWrite→extra.cache_write.
+ *   cost.total→cost_usd except for quorum's placeholder; cacheWrite→extra.cache_write.
  * Buckets stay DISJOINT (input excludes cacheRead, verified against the log:
  * input+output+cacheRead == totalTokens). cost rides per-step `metrics.cost_usd`
  * and cache-write rides `step.extra.cache_write` — the two locations obol's atif
  * dialect actually reads (it ignores metrics.extra.cache_write + final_metrics).
+ * A runner-qualified Pi placeholder zero is retained in step.extra while its
+ * cost_usd is omitted so obol prices the canonical token buckets.
  * Returns undefined when the message carries no usage fields at all.
  */
 function piMessageUsage(
   usage: PiUsage | undefined,
   provider: string | undefined,
+  model: string | undefined,
+  context: AtifNormalizationContext | undefined,
 ): {
   metrics?: AtifMetrics | undefined;
   extra?: Record<string, unknown> | undefined;
 } {
   const metrics: AtifMetrics = {};
+  const extra: Record<string, unknown> = {};
   if (usage && typeof usage === 'object') {
     const prompt = numberOrUndefined(usage.input);
     const completion = numberOrUndefined(usage.output);
@@ -98,10 +110,25 @@ function piMessageUsage(
     if (prompt !== undefined) metrics.prompt_tokens = prompt;
     if (completion !== undefined) metrics.completion_tokens = completion;
     if (cached !== undefined) metrics.cached_tokens = cached;
-    if (cost !== undefined) metrics.cost_usd = cost;
+    const zeroPolicy = context?.pi?.placeholderZeroCost;
+    const isQualifiedPlaceholderZero =
+      zeroPolicy !== undefined &&
+      cost === 0 &&
+      provider === zeroPolicy.provider &&
+      model === zeroPolicy.model;
+    if (cost !== undefined && !isQualifiedPlaceholderZero)
+      metrics.cost_usd = cost;
+
+    if (isQualifiedPlaceholderZero) {
+      extra['cost_normalization'] = {
+        policy: zeroPolicy.policy,
+        recorded_cost_usd: cost,
+        provider,
+        model,
+      };
+    }
   }
 
-  const extra: Record<string, unknown> = {};
   if (provider) extra['provider'] = provider;
   const cacheWrite = numberOrUndefined(usage?.cacheWrite);
   if (cacheWrite !== undefined && cacheWrite !== 0)
@@ -171,12 +198,17 @@ function formatToolResult(
  * are linked back to the agent step holding the matching tool call, satisfying
  * ATIF's same-step observation invariant.
  *
- * Token/cost conventions (preserved): input→prompt, output→completion,
- * cacheRead→cached, cost.total→cost_usd (per-step metrics — pi carries cost),
- * cacheWrite→step.extra.cache_write, provider→step.extra.provider. Per-step
- * only; no final_metrics token totals (single-source invariant).
+ * Token/cost conventions: input→prompt, output→completion, cacheRead→cached,
+ * cost.total→cost_usd, cacheWrite→step.extra.cache_write,
+ * provider→step.extra.provider. Only a runner-qualified placeholder zero is
+ * omitted so obol prices the retained buckets. Per-step only; no final_metrics
+ * token totals (single-source invariant).
  */
-export function normalizePi(raw: string, version: string): AtifTrajectory {
+export function normalizePi(
+  raw: string,
+  version: string,
+  context?: AtifNormalizationContext,
+): AtifTrajectory {
   const entries: PiEntry[] = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -218,6 +250,13 @@ export function normalizePi(raw: string, version: string): AtifTrajectory {
     const message = entry['message'];
     if (!message || typeof message !== 'object') continue;
     const role = message['role'];
+    const timestamp = nativeTimestamp(entry['timestamp']);
+    const applySource = (step: AtifStep): void => {
+      if (timestamp) step.timestamp = timestamp;
+      if (sessionId) {
+        step.extra = { ...step.extra, source_session_id: sessionId };
+      }
+    };
 
     if (role === 'user') {
       const texts: string[] = [];
@@ -236,7 +275,13 @@ export function normalizePi(raw: string, version: string): AtifTrajectory {
         .filter((p) => p)
         .join('\n\n');
       if (textMessage) {
-        steps.push({ step_id: stepId++, source: 'user', message: textMessage });
+        const step: AtifStep = {
+          step_id: stepId++,
+          source: 'user',
+          message: textMessage,
+        };
+        applySource(step);
+        steps.push(step);
       }
       continue;
     }
@@ -266,7 +311,12 @@ export function normalizePi(raw: string, version: string): AtifTrajectory {
       typeof message.model === 'string' && message.model
         ? message.model
         : activeModel;
-    const { metrics, extra } = piMessageUsage(message.usage, message.provider);
+    const { metrics, extra } = piMessageUsage(
+      message.usage,
+      message.provider,
+      model,
+      context,
+    );
     const applyUsage = (step: AtifStep): void => {
       if (model) step.model_name = model;
       if (metrics) step.metrics = metrics;
@@ -329,6 +379,7 @@ export function normalizePi(raw: string, version: string): AtifTrajectory {
         source: 'agent',
         tool_calls: [tc],
       };
+      applySource(step);
 
       // Attach this message's text/reasoning to its FIRST tool step.
       if (!contentAttached) {
@@ -354,6 +405,7 @@ export function normalizePi(raw: string, version: string): AtifTrajectory {
       (messageText || reasoningText || metrics || extra)
     ) {
       const step: AtifStep = { step_id: stepId++, source: 'agent' };
+      applySource(step);
       if (messageText) step.message = messageText;
       if (reasoningText) step.reasoning_content = reasoningText;
       applyUsage(step);

@@ -301,6 +301,42 @@ function makeUsageMessage(content: unknown[], usage: unknown): string {
   });
 }
 
+function makeRoutedUsageMessage(
+  provider: string,
+  model: string,
+  cost: number,
+): string {
+  return JSON.stringify({
+    type: 'message',
+    message: {
+      role: 'assistant',
+      provider,
+      model,
+      usage: {
+        input: 100,
+        output: 20,
+        cacheRead: 10,
+        cacheWrite: 0,
+        totalTokens: 130,
+        cost: { total: cost },
+      },
+      content: [
+        { type: 'toolCall', id: 'cost-call', name: 'read', arguments: {} },
+      ],
+    },
+  });
+}
+
+const PI_PLACEHOLDER_ZERO_CONTEXT = {
+  pi: {
+    placeholderZeroCost: {
+      provider: 'quorum',
+      model: 'gpt-5.6-sol',
+      policy: 'unconfigured-provider-model-rates',
+    },
+  },
+} as const;
+
 const usageLines = [
   sessionHeader,
   makeUsageMessage(
@@ -456,6 +492,81 @@ test('messages without usage produce no metrics', () => {
   }
 });
 
+test('scoped Pi custom-route placeholder zero is retained as metadata but not authoritative cost', () => {
+  const traj = normalizePi(
+    [sessionHeader, makeRoutedUsageMessage('quorum', 'gpt-5.6-sol', 0)].join(
+      '\n',
+    ),
+    '0.80.7',
+    PI_PLACEHOLDER_ZERO_CONTEXT,
+  );
+  const step = traj.steps.find((candidate) => candidate.metrics)!;
+
+  expect(step.metrics).toMatchObject({
+    prompt_tokens: 100,
+    completion_tokens: 20,
+    cached_tokens: 10,
+  });
+  expect(step.metrics?.cost_usd).toBeUndefined();
+  expect(step.extra).toMatchObject({
+    provider: 'quorum',
+    cost_normalization: {
+      policy: 'unconfigured-provider-model-rates',
+      recorded_cost_usd: 0,
+      provider: 'quorum',
+      model: 'gpt-5.6-sol',
+    },
+  });
+});
+
+test('Pi placeholder-zero policy preserves positive costs and zeros outside its exact provider/model', () => {
+  const cases = [
+    { provider: 'quorum', model: 'gpt-5.6-sol', cost: 0.25 },
+    { provider: 'openai-codex', model: 'gpt-5.6-sol', cost: 0 },
+    { provider: 'quorum', model: 'gpt-5.5', cost: 0 },
+  ] as const;
+
+  for (const { provider, model, cost } of cases) {
+    const traj = normalizePi(
+      [sessionHeader, makeRoutedUsageMessage(provider, model, cost)].join('\n'),
+      '0.80.7',
+      PI_PLACEHOLDER_ZERO_CONTEXT,
+    );
+    const step = traj.steps.find((candidate) => candidate.metrics)!;
+    expect(step.metrics?.cost_usd).toBe(cost);
+    expect(step.extra?.['cost_normalization']).toBeUndefined();
+  }
+});
+
+test('Pi zero remains authoritative without a normalization policy', () => {
+  const traj = normalizePi(
+    [sessionHeader, makeRoutedUsageMessage('quorum', 'gpt-5.6-sol', 0)].join(
+      '\n',
+    ),
+    '0.80.7',
+  );
+  const step = traj.steps.find((candidate) => candidate.metrics)!;
+
+  expect(step.metrics?.cost_usd).toBe(0);
+  expect(step.extra?.['cost_normalization']).toBeUndefined();
+});
+
+test('Pi zero without a recorded provider remains authoritative', () => {
+  const line = JSON.stringify({
+    type: 'message',
+    message: {
+      role: 'assistant',
+      model: 'gpt-5.6-sol',
+      usage: { input: 10, output: 2, cost: { total: 0 } },
+      content: [{ type: 'text', text: 'done' }],
+    },
+  });
+
+  const step = normalizePi(line, '0.80.7').steps[0]!;
+  expect(step.metrics?.cost_usd).toBe(0);
+  expect(step.extra?.['cost_normalization']).toBeUndefined();
+});
+
 // ---------------------------------------------------------------------------
 // Full-fidelity content (reverse-engineered from a real captured pi session,
 // see test/fixtures/pi-session.slice.jsonl). Asserts message text, reasoning,
@@ -466,6 +577,55 @@ const fixtureSlice = readFileSync(
   new URL('./fixtures/pi-session.slice.jsonl', import.meta.url),
   'utf8',
 );
+
+test('native message timestamps survive in ATIF user, tool, and final-answer steps', () => {
+  const traj = normalizePi(fixtureSlice, '0.80.7');
+  // Header/model-change timestamps are not conversation steps. Tool results
+  // attach to the call without replacing its timestamp with completion time.
+  expect(traj.steps.map((step) => step.timestamp)).toEqual([
+    '2026-06-15T21:10:00.000Z',
+    '2026-06-15T21:10:05.000Z',
+    '2026-06-15T21:10:10.000Z',
+    '2026-06-15T21:11:05.000Z',
+    '2026-06-15T21:11:10.000Z',
+  ]);
+});
+
+test('every tool step split from one Pi message retains its timestamp', () => {
+  const raw = JSON.stringify({
+    type: 'message',
+    timestamp: '2026-06-15T14:10:05.123-07:00',
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'toolCall', id: 'a', name: 'read', arguments: { path: 'a' } },
+        { type: 'toolCall', id: 'b', name: 'read', arguments: { path: 'b' } },
+      ],
+    },
+  });
+  expect(
+    normalizePi(raw, '0.80.7').steps.map((step) => step.timestamp),
+  ).toEqual(['2026-06-15T14:10:05.123-07:00', '2026-06-15T14:10:05.123-07:00']);
+});
+
+test('missing or malformed Pi timestamps stay absent without losing conversation content', () => {
+  for (const timestamp of [undefined, null, 42, '', 'not-a-timestamp']) {
+    const raw = fixtureSlice
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const entry = JSON.parse(line);
+        if (entry.type === 'message') entry.timestamp = timestamp;
+        return JSON.stringify(entry);
+      })
+      .join('\n');
+    const traj = normalizePi(raw, '0.80.7');
+    expect(traj.steps).toHaveLength(5);
+    expect(traj.steps.every((step) => !('timestamp' in step))).toBe(true);
+    expect(traj.steps[0]?.message).toContain('I have a plan at plan.md.');
+    expect(validateTrajectory(traj).ok).toBe(true);
+  }
+});
 
 test('session id is read from the type:session entry', () => {
   const traj = normalizePi(fixtureSlice, '0.3.0');
@@ -565,7 +725,10 @@ test('disjoint buckets preserved and per-step cost is present', () => {
     cached_tokens: 9728,
     cost_usd: 0.033699,
   });
-  expect(readStep.extra).toEqual({ provider: 'openai-codex' });
+  expect(readStep.extra).toEqual({
+    source_session_id: '019ecd1e-996e-70ba-8042-aeaa4c391744',
+    provider: 'openai-codex',
+  });
 });
 
 test('cache_write rides on step.extra.cache_write (not metrics.extra)', () => {
@@ -573,7 +736,11 @@ test('cache_write rides on step.extra.cache_write (not metrics.extra)', () => {
   const agentStep = traj.steps.find(
     (s) => s.tool_calls?.[0]?.function_name === 'Agent',
   )!;
-  expect(agentStep.extra).toEqual({ provider: 'openai-codex', cache_write: 8 });
+  expect(agentStep.extra).toEqual({
+    source_session_id: '019ecd1e-996e-70ba-8042-aeaa4c391744',
+    provider: 'openai-codex',
+    cache_write: 8,
+  });
   // cache_write must NOT be under metrics.extra (obol ignores that location)
   expect(agentStep.metrics!.extra).toBeUndefined();
 });
@@ -631,4 +798,126 @@ test('model_change is tracked forward when a message omits its own model', () =>
   const traj = normalizePi(lines, '0.3.0');
   const step = traj.steps.find((s) => s.metrics)!;
   expect(step.model_name).toBe('gpt-5.5');
+});
+
+test('native message chronology and session identity reach every derived step', () => {
+  const lines = [
+    JSON.stringify({
+      type: 'session',
+      id: 'main-session',
+      timestamp: '2026-09-08T19:33:32.000Z',
+      cwd: '/tmp/project',
+    }),
+    JSON.stringify({
+      type: 'model_change',
+      provider: 'quorum',
+      modelId: 'gpt-5.6-sol',
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-09-08T19:33:32.640Z',
+      message: {
+        role: 'user',
+        timestamp: '2026-09-08T19:33:32.640Z',
+        content: [{ type: 'text', text: 'Inspect both files.' }],
+      },
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-09-08T19:33:35.000Z',
+      message: {
+        role: 'assistant',
+        provider: 'quorum',
+        model: 'gpt-5.6-sol',
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 30,
+          cacheWrite: 4,
+          cost: { total: 0 },
+        },
+        content: [
+          { type: 'text', text: 'I will inspect both.' },
+          {
+            type: 'toolCall',
+            id: 'read-a',
+            name: 'read',
+            arguments: { path: 'a.ts' },
+          },
+          {
+            type: 'toolCall',
+            id: 'read-b',
+            name: 'read',
+            arguments: { path: 'b.ts' },
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-09-08T19:33:40.000Z',
+      message: {
+        role: 'assistant',
+        provider: 'quorum',
+        model: 'gpt-5.6-sol',
+        content: [{ type: 'text', text: 'Inspection complete.' }],
+      },
+    }),
+  ].join('\n');
+
+  const trajectory = normalizePi(lines, '0.80.7', PI_PLACEHOLDER_ZERO_CONTEXT);
+
+  expect(trajectory.session_id).toBe('main-session');
+  expect(trajectory.steps.map((step) => step.timestamp)).toEqual([
+    '2026-09-08T19:33:32.640Z',
+    '2026-09-08T19:33:35.000Z',
+    '2026-09-08T19:33:35.000Z',
+    '2026-09-08T19:33:40.000Z',
+  ]);
+  expect(
+    trajectory.steps.map((step) => step.extra?.['source_session_id']),
+  ).toEqual(['main-session', 'main-session', 'main-session', 'main-session']);
+  expect(trajectory.steps[1]?.metrics).toMatchObject({
+    prompt_tokens: 100,
+    completion_tokens: 20,
+    cached_tokens: 30,
+  });
+  expect(trajectory.steps[1]?.metrics?.cost_usd).toBeUndefined();
+  expect(trajectory.steps[1]?.extra).toMatchObject({
+    source_session_id: 'main-session',
+    provider: 'quorum',
+    cache_write: 4,
+  });
+  expect(trajectory.steps[2]?.metrics).toBeUndefined();
+});
+
+test('missing and invalid native timestamps remain absent', () => {
+  const lines = [
+    JSON.stringify({ type: 'session', id: 'session-a', cwd: '/tmp/project' }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: 'not-a-timestamp',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'First' }],
+      },
+    }),
+    JSON.stringify({
+      type: 'message',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Second' }],
+      },
+    }),
+  ].join('\n');
+
+  const trajectory = normalizePi(lines, '0.80.7');
+
+  expect(trajectory.steps.map((step) => step.timestamp)).toEqual([
+    undefined,
+    undefined,
+  ]);
+  expect(
+    trajectory.steps.map((step) => step.extra?.['source_session_id']),
+  ).toEqual(['session-a', 'session-a']);
 });

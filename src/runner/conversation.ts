@@ -38,12 +38,17 @@ import {
   type FinalVerdict,
   type GauntletLayer,
   GauntletLayerSchema,
+  type RunError,
   type RunErrorStage,
 } from '../contracts/verdict.ts';
 import { buildRunEconomics } from '../economics.ts';
+import type { AtifNormalizationContext } from '../normalize/context.ts';
+import { estimateUsageSidecar } from '../obol/index.ts';
+import { type AssessmentBudget, durationMs } from '../story-meta.ts';
 import { projectConversationStory } from './conversation-input.ts';
 import { invokeGauntletRole } from './gauntlet-role.ts';
 import { type RunIdentity, writePhase } from './phase.ts';
+import { reconcileAssessmentAccounting } from './role-usage.ts';
 
 export type PreparedConversation = {
   runDir: string;
@@ -55,7 +60,8 @@ export type PreparedConversation = {
   runHomeDir: string;
   configDir: string;
   codingAgent: string;
-  normalizer: 'claude' | 'codex';
+  normalizer: 'claude' | 'codex' | 'pi';
+  normalizationContext?: AtifNormalizationContext | undefined;
   logDir: string;
   logGlob: string;
   snapshot: ReturnType<typeof snapshotDir>;
@@ -68,6 +74,7 @@ export type PreparedConversation = {
   gauntletBin: string;
   graderModel: string;
   maxTime: string;
+  assessmentBudget: AssessmentBudget;
   envBase: Readonly<Record<string, string | undefined>>;
   shouldStop: () => boolean;
   identity: RunIdentity;
@@ -110,14 +117,6 @@ function retainConversationRecord(
   return fallback;
 }
 
-function durationMs(value: string): number {
-  const match = /^(\d+)(ms|s|m|h)?$/.exec(value);
-  if (!match) throw new Error(`invalid role duration: ${value}`);
-  return (
-    Number(match[1]) *
-    ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[match[2] ?? 's'] ?? 1000)
-  );
-}
 function runId(scenario: string): string {
   if (!/^[a-zA-Z0-9-]+$/.test(scenario))
     throw new Error('invalid conversation scenario id');
@@ -129,7 +128,7 @@ function runId(scenario: string): string {
       'Z',
     )}_${Math.random().toString(36).slice(2, 6).padEnd(4, '0')}`;
 }
-function regularFile(root: string, path: string): string {
+export function regularFile(root: string, path: string): string {
   EvidenceIndexSchema.parse({ files: [path] });
   const full = join(root, path);
   const real = realpathSync(full);
@@ -142,6 +141,63 @@ function regularFile(root: string, path: string): string {
     throw new Error(`invalid evidence file: ${path}`);
   accessSync(full, constants.R_OK);
   return full;
+}
+const CaptureGridSchema = z.object({
+  cells: z.array(z.array(z.object({ ch: z.string() }))),
+});
+function renderedCapture(path: string): string {
+  const grid = CaptureGridSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
+  return grid.cells
+    .map((row) =>
+      row
+        .map((cell) => cell.ch)
+        .join('')
+        .trimEnd(),
+    )
+    .join('\n')
+    .trimEnd();
+}
+function observedStartupEvidence(
+  runDir: string,
+  conversationOut: string,
+): ConversationRecord['evidence'] {
+  const exchangePath = join(conversationOut, 'exchange.jsonl');
+  if (!existsSync(exchangePath)) return null;
+  const rows = readFileSync(exchangePath, 'utf8').trimEnd().split('\n');
+  for (let index = rows.length - 1; index >= 0; index--) {
+    try {
+      const row = rows[index];
+      if (row === undefined) continue;
+      const event = z
+        .object({
+          kind: z.literal('startup'),
+          status: z.enum(['observed', 'ready', 'exited', 'timed_out']),
+          capture: z.string(),
+        })
+        .passthrough()
+        .parse(JSON.parse(row));
+      if (event.status !== 'observed') return null;
+      const ansi = regularFile(conversationOut, event.capture);
+      if (
+        !event.capture.startsWith('captures/') ||
+        !event.capture.endsWith('.ansi')
+      )
+        continue;
+      const json = regularFile(
+        conversationOut,
+        event.capture.replace(/\.ansi$/, '.json'),
+      );
+      const quote = renderedCapture(json)
+        .split('\n')
+        .findLast((line) => line.trim() !== '')
+        ?.trim();
+      if (quote === undefined || quote === '') continue;
+      return { path: relative(runDir, ansi), quote };
+    } catch {
+      /* Ignore partial, malformed, or unsafe startup evidence. */
+    }
+  }
+  return null;
 }
 
 async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
@@ -163,6 +219,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
   let gauntlet: GauntletLayer | null = null;
   let checks = [...a.preRecords];
   let stage: RunErrorStage = 'setup';
+  let checkError: RunError | null = null;
   let captureEmpty = true;
   const files: string[] = [];
   const index = () => {
@@ -175,12 +232,13 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
   const incomplete = (
     status: 'stopped' | 'timed_out' | 'errored',
     reason: string,
+    evidence: ConversationRecord['evidence'] = null,
   ): ConversationRecord => ({
     status,
     endpoint: null,
     reason,
     timestamp: new Date().toISOString(),
-    evidence: null,
+    evidence,
   });
   const fail = (
     failureStage: RunErrorStage,
@@ -216,7 +274,6 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
     const rubric = join(input, 'rubric.md');
     writeFileSync(brief, projected.brief, { mode: 0o600 });
     writeFileSync(rubric, projected.rubric, { mode: 0o600 });
-    accessSync(join(a.scenarioDir, 'oracle.cjs'), constants.R_OK);
     for (const r of Object.values(roles))
       mkdirSync(join(a.runDir, r.out_dir), { recursive: true });
     if (await stopRequested()) return stopped();
@@ -245,6 +302,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
           socketPath,
           '--model',
           `agent=${a.graderModel}`,
+          ...(a.normalizer === 'claude' ? ['--startup', 'claude'] : []),
           '--max-time',
           a.maxTime,
         ],
@@ -274,6 +332,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
             ? 'timed_out'
             : 'errored',
         'conversation ended without a valid endpoint',
+        observedStartupEvidence(a.runDir, conversationOut),
       );
     conversation = retainConversationRecord(a.runDir, conversation);
     stage = 'capture';
@@ -282,6 +341,16 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
       logGlob: a.logGlob,
       snapshot: a.snapshot,
       normalizer: a.normalizer,
+      normalizationContext: a.normalizationContext,
+      runDir: a.runDir,
+      launchCwd: a.launchCwd,
+    });
+    await captureTokenUsage({
+      logDir: a.logDir,
+      logGlob: a.logGlob,
+      snapshot: a.snapshot,
+      normalizer: a.normalizer,
+      normalizationContext: a.normalizationContext,
       runDir: a.runDir,
       launchCwd: a.launchCwd,
     });
@@ -317,18 +386,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
         conversationOut,
         visible.replace(/\.ansi$/, '.json'),
       );
-      const grid = z
-        .object({ cells: z.array(z.array(z.object({ ch: z.string() }))) })
-        .parse(JSON.parse(readFileSync(captureJson, 'utf8')));
-      const rendered = grid.cells
-        .map((row) =>
-          row
-            .map((cell) => cell.ch)
-            .join('')
-            .trimEnd(),
-        )
-        .join('\n')
-        .trimEnd();
+      const rendered = renderedCapture(captureJson);
       if (!rendered.includes(conversation.evidence.quote))
         throw new Error('completion evidence is not a retained visible quote');
       writeJson(join(evidenceRoot, 'conversation.json'), {
@@ -369,14 +427,6 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
         'capture',
         `native conversation capture unavailable: ${capture.errors.map((e) => e.message).join('; ')}`,
       );
-    await captureTokenUsage({
-      logDir: a.logDir,
-      logGlob: a.logGlob,
-      snapshot: a.snapshot,
-      normalizer: a.normalizer,
-      runDir: a.runDir,
-      launchCwd: a.launchCwd,
-    });
     if (await stopRequested()) return stopped();
     stage = 'checks';
     writePhase(a.runDir, 'checks', a.identity);
@@ -399,44 +449,54 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
     index();
     if (await stopRequested()) return stopped();
     if (post.exitCode !== 0)
-      return fail(
-        'checks',
-        `post-checks crashed (exit ${post.exitCode}): ${post.stderr}`,
-      );
+      checkError = {
+        stage: 'checks',
+        message: `post-checks crashed (exit ${post.exitCode}): ${post.stderr}`,
+      };
     if (a.expectedChecks !== null) {
       const mismatch = compareRecords(a.expectedChecks, checks);
       if (mismatch.missing.length || mismatch.unexpected.length) {
-        return fail(
-          'checks',
-          `expected-check manifest mismatch: ${JSON.stringify(mismatch)}`,
-        );
+        checkError ??= {
+          stage: 'checks',
+          message: `expected-check manifest mismatch: ${JSON.stringify(mismatch)}`,
+        };
       }
     }
     stage = 'gauntlet';
     writePhase(a.runDir, 'agent', a.identity);
     const out = join(a.runDir, roles.assessment.out_dir);
-    roles.assessment = await invokeGauntletRole({
-      role: 'assessment',
-      binary: a.gauntletBin,
-      argv: [
-        'assess',
-        rubric,
-        '--evidence-root',
-        evidenceRoot,
-        '--evidence-index',
-        join(evidenceRoot, 'index.json'),
-        '--out',
-        out,
-        '--model',
-        `agent=${a.graderModel}`,
-        '--max-time',
-        '2m',
-      ],
-      runDir: a.runDir,
-      env: a.envBase,
-      deadlineMs: 120000,
-      shouldStop: a.shouldStop,
-    });
+    let assessmentError: string | null = null;
+    try {
+      roles.assessment = await invokeGauntletRole({
+        role: 'assessment',
+        binary: a.gauntletBin,
+        argv: [
+          'assess',
+          rubric,
+          '--evidence-root',
+          evidenceRoot,
+          '--evidence-index',
+          join(evidenceRoot, 'index.json'),
+          '--out',
+          out,
+          '--model',
+          `agent=${a.graderModel}`,
+          '--max-time',
+          `${a.assessmentBudget.totalMs}ms`,
+          '--report-grace',
+          `${a.assessmentBudget.reportGraceMs}ms`,
+        ],
+        runDir: a.runDir,
+        env: a.envBase,
+        deadlineMs: a.assessmentBudget.totalMs,
+        shouldStop: a.shouldStop,
+      });
+    } catch (error) {
+      assessmentError = error instanceof Error ? error.message : String(error);
+      roles.assessment = GauntletRolesSchema.parse(
+        JSON.parse(readFileSync(join(a.runDir, 'gauntlet-roles.json'), 'utf8')),
+      ).assessment;
+    }
     const processExit = roles.assessment.process_exit;
     try {
       gauntlet = GauntletLayerSchema.parse({
@@ -455,6 +515,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
     }
     if (roles.assessment.stop_cause === 'cancelled' || (await stopRequested()))
       return stopped();
+    if (assessmentError !== null) return fail('gauntlet', assessmentError);
     const expectedExit = gauntlet.status === 'pass' ? 0 : 1;
     if (
       processExit?.code !== expectedExit ||
@@ -472,9 +533,18 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
           !c.criterion.trim() ||
           !c.evidence.trim() ||
           !['pass', 'fail', 'unclear'].includes(c.verdict),
-      ) ||
-      (gauntlet.status === 'pass' && criteria.some((c) => c.verdict !== 'pass'))
+      )
     )
+      return fail(
+        'gauntlet',
+        'Assessment inconclusive: missing or inconsistent criteria',
+      );
+    const expectedAssessmentStatus = criteria.some((c) => c.verdict === 'fail')
+      ? 'fail'
+      : criteria.every((c) => c.verdict === 'pass')
+        ? 'pass'
+        : 'investigate';
+    if (gauntlet.status !== expectedAssessmentStatus)
       return fail(
         'gauntlet',
         'Assessment inconclusive: missing or inconsistent criteria',
@@ -484,7 +554,7 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
       gauntlet,
       checks,
       captureEmpty,
-      error: null,
+      error: checkError,
       expected: a.expectedChecks,
     });
     return { ...verdict, conversation };
@@ -505,14 +575,97 @@ async function runConversation(a: PreparedConversation): Promise<FinalVerdict> {
 export async function runPreparedConversation(
   a: PreparedConversation,
 ): Promise<FinalVerdict> {
-  const verdict = await runConversation(a);
+  let verdict = await runConversation(a);
   let economics: FinalVerdict['economics'] = null;
+  let projectionDir: string | undefined;
   try {
-    const measured = await buildRunEconomics(a.runDir);
+    const roles = GauntletRolesSchema.parse(
+      JSON.parse(readFileSync(join(a.runDir, 'gauntlet-roles.json'), 'utf8')),
+    );
+    const out = join(a.runDir, roles.assessment.out_dir);
+    const readSidecar = (name: string) => {
+      try {
+        return readFileSync(join(out, name), 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+        throw error;
+      }
+    };
+    const reconciled =
+      roles.assessment.started_at === null
+        ? null
+        : reconcileAssessmentAccounting({
+            runJsonl: readSidecar('run.jsonl'),
+            usageJsonl: readSidecar('usage.jsonl'),
+            attemptsJsonl: readSidecar('assessment-attempts.jsonl'),
+          });
+    if (
+      reconciled !== null &&
+      !reconciled.reportEligible &&
+      verdict.error === null
+    ) {
+      const message = `Assessment accounting incomplete: ${reconciled.error ?? 'missing completed logical history'}`;
+      verdict = {
+        ...verdict,
+        ...compose({
+          gauntlet: verdict.gauntlet,
+          checks: verdict.checks,
+          captureEmpty: false,
+          error: { stage: 'gauntlet', message },
+          expected: a.expectedChecks,
+        }),
+      };
+    }
+    // A disposable filtered view lets the existing obol estimator price valid
+    // known rows even when the raw tail or sibling identities are invalid.
+    // Producer artifacts remain untouched; this is not a second usage ledger.
+    let projectedUsage: string | undefined;
+    if (reconciled !== null) {
+      projectionDir = mkdtempSync(join(a.runDir, '.assessment-pricing-'));
+      projectedUsage = join(projectionDir, 'usage.jsonl');
+      writeFileSync(projectedUsage, reconciled.knownUsageJsonl, {
+        mode: 0o600,
+      });
+    }
+    const measured = await buildRunEconomics(a.runDir, (path) =>
+      estimateUsageSidecar(
+        path === join(out, 'usage.jsonl') && projectedUsage !== undefined
+          ? projectedUsage
+          : path,
+      ),
+    );
     economics =
       measured === null ? null : z.record(z.unknown()).parse(measured);
+    if (economics !== null && reconciled !== null) {
+      economics['assessment_accounting'] = {
+        ...reconciled.accounting,
+        complete: reconciled.complete,
+        error: reconciled.error,
+      };
+      if (!reconciled.complete) {
+        economics['partial'] = true;
+        economics['total_est_cost_usd'] = null;
+      }
+    }
   } catch {
-    /* Cost failure cannot erase the verdict. */
+    // An unreadable accounting source cannot qualify an otherwise completed
+    // assessment. Cost failure also cannot erase a preexisting execution error.
+    if (verdict.error === null) {
+      const message = 'Assessment accounting unavailable';
+      verdict = {
+        ...verdict,
+        ...compose({
+          gauntlet: verdict.gauntlet,
+          checks: verdict.checks,
+          captureEmpty: false,
+          error: { stage: 'gauntlet', message },
+          expected: a.expectedChecks,
+        }),
+      };
+    }
+  } finally {
+    if (projectionDir !== undefined)
+      rmSync(projectionDir, { recursive: true, force: true });
   }
   return { ...verdict, economics };
 }

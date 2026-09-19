@@ -188,6 +188,81 @@ test('captureToolCalls merges claude logs by message timestamp, not path', () =>
   expect(res.rowCount).toBe(3);
 });
 
+test('captureToolCalls merges nested Pi sessions by native time with source identity', () => {
+  const logDir = mkdtempSync(join(tmpdir(), 'logs-'));
+  const runDir = mkdtempSync(join(tmpdir(), 'run-'));
+  const snap = snapshotDir(logDir, '**/*.jsonl');
+
+  const session = (
+    id: string,
+    timestamp: string,
+    role: 'user' | 'assistant',
+    content: unknown[],
+  ) =>
+    [
+      JSON.stringify({ type: 'session', id, cwd: runDir }),
+      JSON.stringify({
+        type: 'message',
+        timestamp,
+        message: { role, content },
+      }),
+    ].join('\n');
+
+  writeFileSync(
+    join(logDir, 'a-late.jsonl'),
+    `${session('late-session', '2026-09-08T19:33:36.000Z', 'assistant', [
+      { type: 'text', text: 'late' },
+    ])}\n`,
+  );
+  const nested = join(logDir, 'nested');
+  mkdirSync(nested);
+  writeFileSync(
+    join(nested, 'b-early.jsonl'),
+    `${session('early-session', '2026-09-08T19:33:32.640Z', 'user', [
+      { type: 'text', text: 'early' },
+    ])}\n`,
+  );
+  writeFileSync(
+    join(logDir, 'z-middle.jsonl'),
+    `${session('middle-session', '2026-09-08T19:33:34.000Z', 'assistant', [
+      { type: 'text', text: 'middle' },
+      {
+        type: 'toolCall',
+        id: 'read-middle',
+        name: 'read',
+        arguments: { path: 'middle.ts' },
+      },
+    ])}\n`,
+  );
+
+  const result = captureToolCalls({
+    logDir,
+    logGlob: '**/*.jsonl',
+    snapshot: snap,
+    normalizer: 'pi',
+    runDir,
+    launchCwd: runDir,
+  });
+  const trajectory = readTrajectory(runDir);
+
+  expect(
+    result.sourceLogs.map((path) => path.slice(logDir.length + 1)),
+  ).toEqual(['a-late.jsonl', 'nested/b-early.jsonl', 'z-middle.jsonl']);
+  expect(trajectory.steps.map((step) => step.message)).toEqual([
+    'early',
+    'middle',
+    'late',
+  ]);
+  expect(trajectory.steps.map((step) => step.timestamp)).toEqual([
+    '2026-09-08T19:33:32.640Z',
+    '2026-09-08T19:33:34.000Z',
+    '2026-09-08T19:33:36.000Z',
+  ]);
+  expect(
+    trajectory.steps.map((step) => step.extra?.['source_session_id']),
+  ).toEqual(['early-session', 'middle-session', 'late-session']);
+});
+
 test('captureToolCalls keeps a mid-stream untimestamped step in file order', () => {
   // A single claude log: Bash@t1, a flat top-level tool_use Read with NO
   // timestamp, then Edit@t3. The untimestamped Read must stay BETWEEN its
@@ -508,13 +583,13 @@ test('captureToolCallsWithRetry retries unavailable evidence and accepts delayed
   expect(sleeps).toBe(1);
 });
 
-test('captureToolCalls rejects Codex synthetic empty and usage-only fallback steps', () => {
-  for (const suffix of ['empty', 'usage-only']) {
+test('captureToolCalls rejects empty and usage-only evidence while retaining priceable usage', async () => {
+  for (const suffix of ['empty', 'usage-only', 'total-only']) {
     const logDir = mkdtempSync(join(tmpdir(), 'logs-'));
     const runDir = mkdtempSync(join(tmpdir(), 'run-'));
     const snap = snapshotDir(logDir, '**/*.jsonl');
     const rows: object[] = [{ type: 'session_meta', payload: { cwd: runDir } }];
-    if (suffix === 'usage-only') {
+    if (suffix !== 'empty') {
       rows.push(
         { type: 'turn_context', payload: { model: 'gpt-test' } },
         {
@@ -529,13 +604,17 @@ test('captureToolCalls rejects Codex synthetic empty and usage-only fallback ste
                 reasoning_output_tokens: 0,
                 total_tokens: 12,
               },
-              last_token_usage: {
-                input_tokens: 10,
-                cached_input_tokens: 0,
-                output_tokens: 2,
-                reasoning_output_tokens: 0,
-                total_tokens: 12,
-              },
+              ...(suffix === 'total-only'
+                ? {}
+                : {
+                    last_token_usage: {
+                      input_tokens: 10,
+                      cached_input_tokens: 0,
+                      output_tokens: 2,
+                      reasoning_output_tokens: 0,
+                      total_tokens: 12,
+                    },
+                  }),
             },
           },
         },
@@ -557,7 +636,23 @@ test('captureToolCalls rejects Codex synthetic empty and usage-only fallback ste
 
     expect(res.availability).toBe('unavailable');
     expect(res.rowCount).toBe(0);
-    expect(existsSync(res.path)).toBe(false);
+    expect(existsSync(res.path)).toBe(suffix !== 'empty');
+    if (suffix !== 'empty') {
+      const usagePath = await captureTokenUsage({
+        logDir,
+        logGlob: '**/*.jsonl',
+        snapshot: snap,
+        launchCwd: runDir,
+        normalizer: 'codex',
+        runDir,
+      });
+      expect(usagePath).not.toBeNull();
+      if (usagePath === null) throw new Error('Usage evidence was lost');
+      const usage = JSON.parse(readFileSync(usagePath, 'utf8'));
+      expect(usage.total_input).toBe(10);
+      expect(usage.total_output).toBe(2);
+      expect(usage.est_cost_usd).toBeNull();
+    }
   }
 });
 

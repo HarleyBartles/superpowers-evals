@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -50,6 +51,7 @@ import {
   OpenCodeCaptureError,
   snapshotOpencodeSessions,
 } from '../agents/opencode-capture.ts';
+import { piCustomProviderContext } from '../agents/pi.ts';
 import { writePrivateFileNoFollow } from '../agents/private-file.ts';
 import { SERF_API_ENV_FILE_NAME } from '../agents/serf.ts';
 import {
@@ -97,6 +99,7 @@ import type {
   RunError,
   RunErrorStage,
 } from '../contracts/verdict.ts';
+import { GauntletLayerSchema } from '../contracts/verdict.ts';
 import { assertCampaignCredentials } from '../credentials/check.ts';
 import {
   loadCredentialsFile,
@@ -119,10 +122,16 @@ import {
 } from '../openrouter/generations.ts';
 import { hexNonce, nowStampUtc, repoRoot } from '../paths.ts';
 import { runSetup, SetupError } from '../setup-step.ts';
-import { readQuorumMaxTime, readQuorumMode } from '../story-meta.ts';
+import {
+  type AssessmentBudget,
+  assessmentBudgetFromStory,
+  readQuorumMaxTime,
+  readQuorumMode,
+} from '../story-meta.ts';
 import { populateContextDir } from './context.ts';
 import {
   readConversationRecord,
+  regularFile,
   runPreparedConversation,
 } from './conversation.ts';
 import { RunnerError, RunStoppedError } from './errors.ts';
@@ -263,11 +272,15 @@ export function gauntletLayerFromRunDir(runDir: string): GauntletLayer | null {
     const record = data as Record<string, unknown>;
     const summary = record['summary'];
     const reasoning = record['reasoning'];
+    const criteria = GauntletLayerSchema.shape.criteria.safeParse(
+      record['criteria'],
+    );
     return {
       status: coerceGauntletStatus(record['status']),
       summary: typeof summary === 'string' ? summary : '',
       reasoning: typeof reasoning === 'string' ? reasoning : '',
       run_id: runId,
+      ...(criteria.success && criteria.data ? { criteria: criteria.data } : {}),
     };
   }
   return null;
@@ -1503,7 +1516,7 @@ async function runInner(
     readQuorumMode(story) === 'conversation'
   ) {
     throw new RunnerError(
-      'conversation mode supports only Linux Claude and Codex',
+      'conversation mode supports only Linux Claude, Codex, and Pi',
       'setup',
     );
   }
@@ -1614,17 +1627,23 @@ async function runInnerBody(
 
   // 3. Per-scenario duration override (StoryMetaError -> setup runner error).
   let storyMaxTime: string | null;
-  let conversationNormalizer: 'claude' | 'codex' | null = null;
+  let assessmentBudget: AssessmentBudget | null;
+  let conversationNormalizer: 'claude' | 'codex' | 'pi' | null = null;
   try {
     storyMaxTime = readQuorumMaxTime(storyPath);
+    assessmentBudget = assessmentBudgetFromStory(
+      readFileSync(storyPath, 'utf8'),
+    );
     if (readQuorumMode(storyPath) === 'conversation') {
       if (
         os !== 'linux' ||
-        !['claude', 'codex'].includes(cfg.runtime_family ?? cfg.name) ||
-        (cfg.normalizer !== 'claude' && cfg.normalizer !== 'codex')
+        !['claude', 'codex', 'pi'].includes(cfg.runtime_family ?? cfg.name) ||
+        (cfg.normalizer !== 'claude' &&
+          cfg.normalizer !== 'codex' &&
+          cfg.normalizer !== 'pi')
       ) {
         throw new RunnerError(
-          'conversation mode supports only Linux Claude and Codex',
+          'conversation mode supports only Linux Claude, Codex, and Pi',
           'setup',
         );
       }
@@ -1894,6 +1913,8 @@ async function runInnerBody(
   // strips arbitrary env from new sessions, so the QA agent reads concrete
   // paths from the substituted files rather than from env inheritance.
   const family = cfg.runtime_family ?? cfg.name;
+  const normalizationContext =
+    family === 'pi' ? piCustomProviderContext(resolvedCredential) : undefined;
   const isRemote = os !== 'linux';
   const launchAgentPath = join(
     runDir,
@@ -2040,9 +2061,10 @@ async function runInnerBody(
       ? copilotGauntletEnv(envSnapshot())
       : gauntletEnvBase(envSnapshot());
 
-  if (conversationNormalizer !== null) {
+  if (conversationNormalizer !== null && assessmentBudget !== null) {
     return runPreparedConversation({
       runDir,
+      normalizationContext,
       scenarioDir: a.scenarioDir,
       storyPath,
       launcherPath: launchAgentPath,
@@ -2066,6 +2088,7 @@ async function runInnerBody(
       gauntletBin: a.gauntletBin ?? 'gauntlet',
       graderModel: a.graderModel ?? GRADER_MODEL,
       maxTime: maxTime ?? '10m',
+      assessmentBudget,
       envBase: gauntletEnvBaseValue,
       shouldStop: a.shouldStop ?? (() => false),
       identity,
@@ -2247,6 +2270,7 @@ async function runInnerBody(
       normalizer: cfg.normalizer,
       runDir,
       launchCwd,
+      normalizationContext,
     },
     { attempts: CAPTURE_RETRY_ATTEMPTS, delayMs: CAPTURE_RETRY_DELAY_MS },
   );
@@ -2260,7 +2284,25 @@ async function runInnerBody(
     normalizer: cfg.normalizer,
     runDir,
     launchCwd,
+    normalizationContext,
   });
+
+  try {
+    for (const source of capture.sourceLogs) {
+      const path = relative(logDir, source);
+      const target = join(runDir, 'evidence/native', path);
+      const retainedSource = regularFile(logDir, path);
+      mkdirSync(dirname(target), { recursive: true });
+      copyFileSync(retainedSource, target);
+    }
+  } catch (error) {
+    return writeIndeterminate({
+      finalReason: `Native session retention failed: ${String(error)}`,
+      gauntlet,
+      checks: pre.records,
+      error: { stage: 'capture', message: String(error) },
+    });
+  }
 
   // Labeled Serf/OpenRouter campaigns require two independent capture proofs:
   // ATIF/obol token evidence plus metadata attesting every returned generation

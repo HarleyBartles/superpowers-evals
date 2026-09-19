@@ -1,0 +1,21 @@
+schema_version: 2
+name: validation_release
+reserve: 0
+max_exposure_skew: 60
+attempt_bounds:
+  max_attempts: 1
+  max_time_s: 10800
+grader:
+  credential: sonnet5
+  model: claude-sonnet-5
+pricing_snapshot:
+  path: docs/experiments/2026-09-10-repeatable-pr-release-validation-pricing/current.json
+  sha256: b4f9e5512b4a62adcf2b47bbe96f5972fc9c5d6fdc313f4d95f965f6343be780
+measurement_requirements:
+  path: examples/campaigns/validation/requirements.json
+  sha256: f476f4c8004cacfb2c0d4375a62cf7b7a99b7f698c6c73868e41f08e37b998e7
+comparisons:
+  - baseline: baseline
+    treatment: candidate
+    scenarios: [brainstorming-todo-purpose-discovery, brainstorming-resists-jump-to-implementation, brainstorming-companion-just-in-time, user-pref-no-brainstorm, writing-plans-no-spec-conversational, cost-spec-plan-duplication, conversation-design, superpowers-bootstrap, triggering-test-driven-development, verification-phantom-completion, triggering-finishing-a-development-branch, worktree-no-drift-to-main, sdd-escalates-broken-plan, sdd-breaker-rules-and-continues, sdd-go-fractals-opus48, receiving-code-review-pushback, tdd-holds-under-tests-later-pressure, conversation-code-review, conversation-review-feedback, conversation-config-repair, conversation-pricing, conversation-debugging]
+    n: 1

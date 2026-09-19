@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -10,9 +12,17 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import type { AtifTrajectory } from '../src/atif/types.ts';
 import { snapshotDir } from '../src/capture/index.ts';
+import type { RunEconomics } from '../src/economics.ts';
 import { getEnv } from '../src/env.ts';
 import { runPreparedConversation } from '../src/runner/conversation.ts';
+import { assessmentBudgetFromStory } from '../src/story-meta.ts';
+
+const PI_SESSION_LAUNCH_FIXTURE = resolve(
+  import.meta.dir,
+  'fixtures/pi-session-launch.ts',
+);
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -28,7 +38,7 @@ function setup(mode = 'refusal') {
   writeFileSync(join(runDir, 'fixture-mode'), mode);
   writeFileSync(
     join(scenarioDir, 'story.md'),
-    '---\nid: demo\nquorum_mode: conversation\nquorum_max_time: 10m\n---\nPlease fix pricing.\n\n## Acceptance Criteria\n- Fix pricing\n',
+    '---\nid: demo\nquorum_mode: conversation\nquorum_max_time: 10m\nquorum_assessment_max_time: 10m\nquorum_assessment_report_grace: 60s\n---\nPlease fix pricing.\n\n## Acceptance Criteria\n- Fix pricing\n',
   );
   writeFileSync(join(scenarioDir, 'oracle.cjs'), 'process.exit(1)');
   writeFileSync(
@@ -66,6 +76,9 @@ function setup(mode = 'refusal') {
     gauntletBin,
     graderModel: 'offline',
     maxTime: '1s',
+    assessmentBudget: assessmentBudgetFromStory(
+      readFileSync(join(scenarioDir, 'story.md'), 'utf8'),
+    )!,
     envBase: {
       PATH: getEnv('PATH'),
       HOME: runDir,
@@ -80,6 +93,117 @@ function setup(mode = 'refusal') {
     },
   };
 }
+for (const mode of [
+  'missing-marker',
+  'operational-exit',
+  'conversion-error',
+  'duplicate-usage',
+  'truncated-usage',
+  'malformed-usage',
+  'zero-response',
+  'empty-assessment-history',
+  'missing-run-end',
+  'pending-logical-request',
+  'missing-known-usage',
+])
+  test(`${mode} remains operational and retains only valid known physical cost`, async () => {
+    const args = setup(mode);
+    // Cost reconciliation is independent of conversation startup latency.
+    args.maxTime = '15s';
+    const verdict = await runPreparedConversation(args);
+    expect(verdict.final).toBe('indeterminate');
+    expect(verdict.error?.stage).toBe('gauntlet');
+    const role = JSON.parse(
+      readFileSync(join(args.runDir, 'gauntlet-roles.json'), 'utf8'),
+    ).assessment;
+    expect(role.started_at).not.toBeNull();
+    expect(role.finished_at).not.toBeNull();
+    expect(role.process_exit.code).toBe(
+      mode === 'operational-exit' || mode === 'conversion-error' ? 2 : 0,
+    );
+    const economics = verdict.economics as unknown as RunEconomics;
+    if (
+      [
+        'zero-response',
+        'empty-assessment-history',
+        'missing-known-usage',
+      ].includes(mode)
+    )
+      expect(economics.gauntlet?.roles?.assessment.usage).toBeNull();
+    else {
+      expect(economics.gauntlet?.roles?.assessment.usage?.total_tokens).toBe(
+        27,
+      );
+      expect(
+        economics.gauntlet?.roles?.assessment.usage?.est_cost_usd,
+      ).toBeGreaterThan(0);
+    }
+    if (mode === 'conversion-error')
+      expect(verdict.economics?.['assessment_accounting']).toMatchObject({
+        logicalResponses: 0,
+        physicalAttempts: 1,
+      });
+  }, 30_000);
+for (const [mode, status, final, exit] of [
+  ['unknown-usage', 'pass', 'pass', 0],
+  ['unknown-usage-fail', 'fail', 'fail', 1],
+  ['unknown-usage-investigate', 'investigate', 'indeterminate', 1],
+] as const)
+  test(`settled retry preserves semantic ${status} with partial physical cost`, async () => {
+    const args = setup(mode);
+    args.maxTime = '15s';
+    writeFileSync(join(args.scenarioDir, 'oracle.cjs'), 'process.exit(0)');
+    const verdict = await runPreparedConversation(args);
+    expect(verdict.error).toBeNull();
+    expect(verdict.final).toBe(final);
+    expect(verdict.gauntlet).toMatchObject({
+      status,
+      process_exit: { code: exit, signal: null },
+    });
+    expect(verdict.economics?.['assessment_accounting']).toMatchObject({
+      logicalResponses: 1,
+      physicalAttempts: 2,
+      unknownUsageAttemptIds: ['001'],
+      complete: false,
+      error: null,
+    });
+    const economics = verdict.economics as unknown as RunEconomics;
+    expect(economics.partial).toBe(true);
+    expect(economics.total_est_cost_usd).toBeNull();
+    expect(economics.gauntlet?.roles?.assessment.usage?.total_tokens).toBe(27);
+    expect(
+      economics.gauntlet?.roles?.assessment.usage?.est_cost_usd,
+    ).toBeGreaterThan(0);
+  }, 30_000);
+for (const checkerPresent of [true, false])
+  test(`Python scenario checker ${checkerPresent ? 'evaluates the subject' : 'fails closed when missing'}`, async () => {
+    const args = setup();
+    args.maxTime = '15s';
+    const scenario = resolve(
+      import.meta.dir,
+      '../scenarios/conversation-config-repair',
+    );
+    rmSync(join(args.scenarioDir, 'oracle.cjs'));
+    cpSync(join(scenario, 'fixtures'), args.workdir, { recursive: true });
+    cpSync(join(scenario, 'checks.sh'), args.checksSh);
+    if (checkerPresent)
+      cpSync(join(scenario, 'oracle.py'), join(args.scenarioDir, 'oracle.py'));
+
+    const verdict = await runPreparedConversation(args);
+
+    expect(verdict.conversation?.status).toBe('completed');
+    expect(verdict.final).toBe(checkerPresent ? 'fail' : 'indeterminate');
+    expect(verdict.error?.stage ?? null).toBe(checkerPresent ? null : 'checks');
+    expect(verdict.checks.some((c) => c.phase === 'post' && !c.passed)).toBe(
+      true,
+    );
+    const roles = JSON.parse(
+      readFileSync(join(args.runDir, 'gauntlet-roles.json'), 'utf8'),
+    );
+    expect(roles.assessment.started_at).not.toBeNull();
+    expect(verdict.gauntlet?.criteria?.length).toBeGreaterThan(0);
+  }, 30_000);
+
 test('completed refusal retains evidence and failing oracle still reaches isolated assessment', async () => {
   const args = setup();
   const v = await runPreparedConversation(args);
@@ -92,6 +216,10 @@ test('completed refusal retains evidence and failing oracle still reaches isolat
     .map((l) => JSON.parse(l));
   expect(calls.map((c) => c.role)).toEqual(['converse', 'assess']);
   expect(calls[0].input).not.toContain('Acceptance Criteria');
+  expect(calls[0].flags).toContain('--startup');
+  expect(calls[0].flags[calls[0].flags.indexOf('--startup') + 1]).toBe(
+    'claude',
+  );
   expect(calls[1].input).not.toContain('Please fix pricing');
   expect(calls[0].env.home).toBe(args.runHomeDir);
   expect(calls[1].env.home).toBeUndefined();
@@ -187,7 +315,7 @@ for (const mode of ['conversation-hang', 'assessment-hang'])
       mode === 'assessment-hang' ? 'completed' : 'stopped',
     );
   });
-test('a crashed checker preserves completion and records but starts no assessment', async () => {
+test('a crashed checker preserves completion, records and independent assessment', async () => {
   const args = setup();
   writeFileSync(
     args.checksSh,
@@ -201,7 +329,8 @@ test('a crashed checker preserves completion and records but starts no assessmen
     readFileSync(join(args.runDir, 'invocations.jsonl'), 'utf8')
       .trim()
       .split('\n'),
-  ).toHaveLength(1);
+  ).toHaveLength(2);
+  expect(v.gauntlet?.criteria?.length).toBeGreaterThan(0);
 });
 test('cancellation after oracle starts no assessment', async () => {
   const args = setup();
@@ -224,13 +353,13 @@ test('cancellation after oracle starts no assessment', async () => {
   ).toHaveLength(1);
 });
 
-test('runner rejects a non-Claude harness even when it uses the Claude normalizer', async () => {
+test('runner rejects an unsupported family even when it uses the Pi normalizer', async () => {
   const args = setup();
   const agents = join(args.runDir, 'agents');
   mkdirSync(agents);
   writeFileSync(
     join(agents, 'fake.yaml'),
-    'name: fake\nruntime_family: fake\nbinary: /usr/bin/true\nnormalizer: claude\nhome_config_subdir: .claude\nsession_log_dir: "${QUORUM_AGENT_HOME}/logs"\nsession_log_glob: "*.jsonl"\nrequired_env: []\nos_support: [linux]\n',
+    'name: fake\nruntime_family: fake\nbinary: /usr/bin/true\nnormalizer: pi\nhome_config_subdir: .pi/agent\nsession_log_dir: "${QUORUM_AGENT_HOME}/logs"\nsession_log_glob: "*.jsonl"\nrequired_env: []\nos_support: [linux]\n',
   );
   const credentialsPath = join(args.runDir, 'credentials.yaml');
   writeFileSync(credentialsPath, '{}\n');
@@ -246,13 +375,23 @@ test('runner rejects a non-Claude harness even when it uses the Claude normalize
   });
   expect(result.verdict.error?.stage).toBe('setup');
   expect(result.verdict.final_reason).toContain(
-    'conversation mode supports only Linux Claude and Codex',
+    'conversation mode supports only Linux',
   );
   expect(existsSync(join(result.runDir, 'coding-agent-workdir'))).toBe(false);
 });
 
-test('full runner uses prepared launcher/home and returns the persisted completed verdict', async () => {
+test.each([
+  '10m',
+  '5m',
+])('full runner uses prepared launcher/home and the declared %s assessment budget', async (total) => {
   const args = setup();
+  writeFileSync(
+    args.storyPath,
+    readFileSync(args.storyPath, 'utf8').replace(
+      'quorum_assessment_max_time: 10m',
+      `quorum_assessment_max_time: ${total}`,
+    ),
+  );
   const agents = join(args.runDir, 'agents');
   const context = join(agents, 'claude-context');
   mkdirSync(context, { recursive: true });
@@ -297,7 +436,145 @@ test('full runner uses prepared launcher/home and returns the persisted complete
       .conversation,
   ).toEqual(result.verdict.conversation);
   expect(runWasStopped()).toBe(false);
+  expectAssessmentBudget(result.runDir, total);
+}, 30000);
+
+test('Pi default cwd encoding fails at the real filesystem component limit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-session-control-'));
+  dirs.push(root);
+  const cwd = join(
+    root,
+    'private home with space',
+    ...Array.from({ length: 28 }, (_, index) => `level-${index}`),
+  );
+  const outerHome = join(root, 'outer home');
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(outerHome, { recursive: true });
+
+  const result = spawnSync(process.execPath, [PI_SESSION_LAUNCH_FIXTURE], {
+    cwd,
+    env: { HOME: outerHome, PATH: getEnv('PATH') ?? '' },
+    encoding: 'utf8',
+  });
+
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('ENAMETOOLONG');
 });
+
+test('full runner gives Pi the private session root at a deep launch cwd', async () => {
+  const args = setup('full-run');
+  writeFileSync(join(args.scenarioDir, 'setup.sh'), '#!/bin/sh\n:\n');
+  chmodSync(join(args.scenarioDir, 'setup.sh'), 0o755);
+  const credentialsPath = join(args.runDir, 'credentials.yaml');
+  writeFileSync(
+    credentialsPath,
+    'test_subject:\n  model: gpt-5.6-sol\n  api: openai-responses\n  base_url: https://api.openai.com/v1\n  api_key_env: QUORUM_PI_TEST_KEY\n  auth: api-key\n  harnesses: [pi]\n',
+  );
+
+  const shimDir = join(args.runDir, 'shims');
+  const globalModules = join(args.runDir, 'global-modules');
+  const outerHome = join(args.runDir, 'outer home');
+  const deepOutRoot = join(
+    args.runDir,
+    'private home with space',
+    ...Array.from({ length: 28 }, (_, index) => `level-${index}`),
+    'out',
+  );
+  mkdirSync(join(globalModules, 'pi-subagents'), { recursive: true });
+  mkdirSync(shimDir);
+  mkdirSync(outerHome);
+  writeFileSync(
+    join(shimDir, 'npm'),
+    `#!/bin/sh\nprintf '%s\\n' '${globalModules}'\n`,
+  );
+  writeFileSync(
+    join(shimDir, 'pi'),
+    `#!/bin/sh\nexec '${process.execPath}' '${PI_SESSION_LAUNCH_FIXTURE}' "$@"\n`,
+  );
+  chmodSync(join(shimDir, 'npm'), 0o755);
+  chmodSync(join(shimDir, 'pi'), 0o755);
+
+  const savedPath = Bun.env['PATH'];
+  const savedKey = Bun.env['QUORUM_PI_TEST_KEY'];
+  const savedHome = Bun.env['HOME'];
+  Bun.env['PATH'] = `${shimDir}:${savedPath ?? ''}`;
+  Bun.env['QUORUM_PI_TEST_KEY'] = 'offline-pi-key';
+  Bun.env['HOME'] = outerHome;
+  try {
+    const { runScenario } = await import('../src/runner/index.ts');
+    const result = await runScenario({
+      scenarioDir: args.scenarioDir,
+      codingAgent: 'pi',
+      codingAgentsDir: resolve(import.meta.dir, '../coding-agents'),
+      credential: 'test_subject',
+      credentialsPath,
+      outRoot: deepOutRoot,
+      gauntletBin: args.gauntletBin,
+      superpowers: { mode: 'none' },
+      onRunDir(runDir) {
+        const launchCwd = join(runDir, 'coding-agent-workdir');
+        const defaultComponent = `--${resolve(launchCwd)
+          .replace(/^[/\\]/, '')
+          .replace(/[/\\:]/g, '-')}--`;
+        expect(Buffer.byteLength(defaultComponent)).toBeGreaterThan(255);
+      },
+    });
+    expect(result.verdict.error).toBeNull();
+    expect(result.verdict.conversation?.status).toBe('completed');
+    const trajectory: AtifTrajectory = JSON.parse(
+      readFileSync(join(result.runDir, 'evidence/trajectory.json'), 'utf8'),
+    );
+    const pricedSteps = trajectory.steps.filter((step) => step.metrics);
+    expect(pricedSteps.length).toBeGreaterThan(0);
+    for (const step of pricedSteps) {
+      expect(step.metrics?.cost_usd).toBeUndefined();
+      expect(step.extra?.['cost_normalization']).toMatchObject({
+        policy: 'unconfigured-provider-model-rates',
+        provider: 'quorum',
+        model: 'gpt-5.6-sol',
+        recorded_cost_usd: 0,
+      });
+    }
+    expect(
+      existsSync(join(result.runDir, 'evidence/native/session.jsonl')),
+    ).toBe(true);
+    expect(
+      existsSync(join(result.runDir, 'evidence/native/nested/child.jsonl')),
+    ).toBe(true);
+    expect(
+      existsSync(join(result.runDir, 'evidence/native/wrong-cwd.jsonl')),
+    ).toBe(false);
+    expect(existsSync(join(outerHome, '.pi'))).toBe(false);
+    expect(
+      readFileSync(
+        join(result.runDir, 'evidence/output/pi-session-dir.txt'),
+        'utf8',
+      ).trim(),
+    ).toBe(join(result.runDir, 'home/.pi/agent/sessions'));
+    expect(
+      readFileSync(
+        join(result.runDir, 'evidence/output/pi-launch-model.txt'),
+        'utf8',
+      ).trim(),
+    ).toBe('quorum/gpt-5.6-sol');
+    const launcherArgs = readFileSync(
+      join(result.runDir, 'evidence/output/pi-launch-argv.txt'),
+      'utf8',
+    )
+      .trim()
+      .split('\n');
+    expect(launcherArgs).toContain('--provider');
+    expect(launcherArgs).toContain('--model');
+    expect(launcherArgs).not.toContain('--effort');
+  } finally {
+    if (savedPath === undefined) delete Bun.env['PATH'];
+    else Bun.env['PATH'] = savedPath;
+    if (savedKey === undefined) delete Bun.env['QUORUM_PI_TEST_KEY'];
+    else Bun.env['QUORUM_PI_TEST_KEY'] = savedKey;
+    if (savedHome === undefined) delete Bun.env['HOME'];
+    else Bun.env['HOME'] = savedHome;
+  }
+}, 10_000);
 test('conversation Windows rejection runs no setup or role', async () => {
   const args = setup();
   const agents = join(args.runDir, 'agents');
@@ -323,12 +600,12 @@ test('conversation Windows rejection runs no setup or role', async () => {
   });
   expect(result.verdict.error?.stage).toBe('setup');
   expect(result.verdict.final_reason).toContain(
-    'conversation mode supports only Linux Claude and Codex',
+    'conversation mode supports only Linux',
   );
   expect(existsSync(join(result.runDir, 'coding-agent-workdir'))).toBe(false);
 });
 
-test('a check manifest mismatch stops before assessment', async () => {
+test('a check manifest mismatch remains indeterminate with independent assessment', async () => {
   const args = setup();
   const v = await runPreparedConversation({
     ...args,
@@ -339,7 +616,8 @@ test('a check manifest mismatch stops before assessment', async () => {
     readFileSync(join(args.runDir, 'invocations.jsonl'), 'utf8')
       .trim()
       .split('\n'),
-  ).toHaveLength(1);
+  ).toHaveLength(2);
+  expect(v.gauntlet?.criteria?.length).toBeGreaterThan(0);
 });
 
 test('Codex delivery uses native cwd-bound message evidence', async () => {
@@ -352,7 +630,96 @@ test('Codex delivery uses native cwd-bound message evidence', async () => {
   expect(v.final).toBe('fail');
   expect(v.conversation?.endpoint).toBe('delivery');
   expect(existsSync(join(args.runDir, 'evidence/trajectory.json'))).toBe(true);
+  const invocation = JSON.parse(
+    readFileSync(join(args.runDir, 'invocations.jsonl'), 'utf8')
+      .trim()
+      .split('\n')[0]!,
+  );
+  expect(invocation.flags).not.toContain('--startup');
 });
+
+test('Pi delivery retains the real native session only at the launch cwd', async () => {
+  const args = setup('pi-correct');
+  const verdict = await runPreparedConversation({
+    ...args,
+    codingAgent: 'pi',
+    normalizer: 'pi',
+    maxTime: '3s',
+  });
+  expect(verdict.final).toBe('fail');
+  expect(verdict.conversation).toMatchObject({
+    status: 'completed',
+    endpoint: 'delivery',
+  });
+  const files: string[] = JSON.parse(
+    readFileSync(join(args.runDir, 'evidence/index.json'), 'utf8'),
+  ).files;
+  expect(files).toContain('native/native.jsonl');
+  expect(files).toContain('trajectory.json');
+  const trajectory = JSON.parse(
+    readFileSync(join(args.runDir, 'evidence/trajectory.json'), 'utf8'),
+  );
+  expect(trajectory.agent.name).toBe('pi');
+  expect(
+    trajectory.steps.some(
+      (step: { tool_calls?: unknown[] }) => step.tool_calls?.length,
+    ),
+  ).toBe(true);
+});
+
+test('Pi delivery rejects a native session from the wrong cwd before assessment', async () => {
+  const args = setup('pi-wrong-cwd');
+  const verdict = await runPreparedConversation({
+    ...args,
+    codingAgent: 'pi',
+    normalizer: 'pi',
+    maxTime: '3s',
+  });
+  expect(verdict.error?.stage).toBe('capture');
+  expect(verdict.final_reason).toContain(
+    'native conversation capture unavailable',
+  );
+  const files: string[] = JSON.parse(
+    readFileSync(join(args.runDir, 'evidence/index.json'), 'utf8'),
+  ).files;
+  expect(files.some((path) => path.startsWith('native/'))).toBe(false);
+  expect(files).not.toContain('trajectory.json');
+  expect(
+    readFileSync(join(args.runDir, 'invocations.jsonl'), 'utf8')
+      .trim()
+      .split('\n'),
+  ).toHaveLength(1);
+});
+
+test('Pi cancellation retains native evidence and confirms private runtime cleanup', async () => {
+  const args = setup('pi-cancel');
+  const marker = join(args.runDir, 'runtime-pid');
+  const verdict = await runPreparedConversation({
+    ...args,
+    codingAgent: 'pi',
+    normalizer: 'pi',
+    shouldStop: () => existsSync(marker),
+  });
+  expect(verdict.error?.stage).toBe('stopped');
+  expect(
+    (verdict.economics as unknown as RunEconomics)?.coding_agent,
+  ).not.toBeNull();
+  expect(verdict.conversation?.status).toBe('completed');
+  expect(existsSync(join(args.runDir, 'evidence/native/native.jsonl'))).toBe(
+    true,
+  );
+  expect(existsSync(join(args.runDir, 'evidence/trajectory.json'))).toBe(true);
+  const roles = JSON.parse(
+    readFileSync(join(args.runDir, 'gauntlet-roles.json'), 'utf8'),
+  );
+  expect(roles.conversation.stop_cause).toBe('cancelled');
+  expect(roles.conversation.process_exit.signal).toBe('SIGTERM');
+  const socket = readFileSync(join(args.runDir, 'runtime-socket'), 'utf8');
+  expect(existsSync(socket)).toBe(false);
+  const pid = Number(readFileSync(marker, 'utf8'));
+  expect(() => process.kill(-pid, 0)).toThrow();
+});
+
 test('assessment reads only its allocated result file', async () => {
   const args = setup('missing-result');
   const v = await runPreparedConversation(args);
@@ -382,6 +749,58 @@ for (const [mode, final, exit] of [
         : null,
     );
   });
+
+for (const [mode, status, verdicts] of [
+  ['contradictory-all-pass-fail', 'fail', ['pass']],
+  ['contradictory-all-pass-investigate', 'investigate', ['pass']],
+  [
+    'contradictory-mixed-investigate',
+    'investigate',
+    ['pass', 'pass', 'pass', 'fail'],
+  ],
+] as const)
+  test(`${mode} is indeterminate while preserving the contradictory report and evidence`, async () => {
+    const args = setup(mode);
+    const verdict = await runPreparedConversation(args);
+    expect(verdict.final).toBe('indeterminate');
+    expect(verdict.error).toEqual({
+      stage: 'gauntlet',
+      message: 'Assessment inconclusive: missing or inconsistent criteria',
+    });
+    expect(verdict.gauntlet).toMatchObject({ status });
+    expect(verdict.gauntlet?.criteria?.map((row) => row.verdict)).toEqual([
+      ...verdicts,
+    ]);
+    expect(verdict.conversation?.status).toBe('completed');
+    for (const path of [
+      'conversation.json',
+      'checks.json',
+      'output/pricing.js',
+    ])
+      expect(existsSync(join(args.runDir, 'evidence', path))).toBe(true);
+  });
+
+test('a timeout-shaped completed assessment is malformed and retains its report evidence', async () => {
+  const args = setup('assessment-timeout-report');
+  const verdict = await runPreparedConversation(args);
+  expect(verdict.final).toBe('indeterminate');
+  expect(verdict.error).toEqual({
+    stage: 'gauntlet',
+    message: 'Assessment inconclusive: missing or inconsistent criteria',
+  });
+  expect(verdict.gauntlet).toMatchObject({
+    status: 'investigate',
+    summary: 'Assessment timed out',
+    reasoning:
+      'The assessor did not produce a valid report_result within 120000ms.',
+    process_exit: { code: 1, signal: null },
+  });
+  expect(verdict.gauntlet?.criteria).toBeUndefined();
+  expect(verdict.conversation?.status).toBe('completed');
+  expect(existsSync(join(args.runDir, 'evidence/output/pricing.js'))).toBe(
+    true,
+  );
+});
 
 test('outer runner exception retains persisted started-role accounting', async () => {
   const args = setup();
@@ -474,3 +893,60 @@ for (const mode of [
       if (mode === 'error') expect(result.faultCount).toBeGreaterThan(0);
     }
   });
+
+test('usage-only conversation stays indeterminate and retains incurred subject cost', async () => {
+  const args = setup('pi-usage-only');
+  const verdict = await runPreparedConversation({
+    ...args,
+    codingAgent: 'pi',
+    normalizer: 'pi',
+    maxTime: '3s',
+  });
+  expect(verdict.final).toBe('indeterminate');
+  expect(verdict.error?.stage).toBe('capture');
+  const usage = JSON.parse(
+    readFileSync(join(args.runDir, 'coding-agent-token-usage.json'), 'utf8'),
+  );
+  expect(usage.total_input).toBe(10);
+  expect(usage.total_output).toBe(5);
+  expect(usage.est_cost_usd).toBe(0.25);
+  const economics = verdict.economics as unknown as RunEconomics;
+  expect(economics.coding_agent?.est_cost_usd).toBe(0.25);
+  expect(
+    readFileSync(join(args.runDir, 'invocations.jsonl'), 'utf8')
+      .trim()
+      .split('\n'),
+  ).toHaveLength(1);
+});
+
+for (const total of ['10m', '5m'])
+  test(`assessment passes the declared ${total} budget through the process boundary`, async () => {
+    const args = setup();
+    args.maxTime = '10s';
+    const story = readFileSync(args.storyPath, 'utf8').replace(
+      'quorum_assessment_max_time: 10m',
+      `quorum_assessment_max_time: ${total}`,
+    );
+    writeFileSync(args.storyPath, story);
+    args.assessmentBudget = assessmentBudgetFromStory(story)!;
+    await runPreparedConversation(args);
+    expectAssessmentBudget(args.runDir, total);
+  }, 30000);
+
+function expectAssessmentBudget(runDir: string, total: string): void {
+  const invocation = readFileSync(join(runDir, 'invocations.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .find((row) => row.role === 'assess');
+  const roles = JSON.parse(
+    readFileSync(join(runDir, 'gauntlet-roles.json'), 'utf8'),
+  );
+  const deadlineMs =
+    Number(invocation.arguments['hard-deadline-at-ms']) -
+    Date.parse(roles.assessment.started_at);
+  const totalMs = total === '10m' ? 600000 : 300000;
+  expect(deadlineMs).toBe(totalMs);
+  expect(invocation.arguments['max-time']).toBe(`${totalMs}ms`);
+  expect(invocation.arguments['report-grace']).toBe('60000ms');
+}

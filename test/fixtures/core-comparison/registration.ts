@@ -131,6 +131,10 @@ function evalsRepo(): { dir: string; sha: string } {
     join(dir, 'scenarios', 'scn-a', 'checks.sh'),
     'pre() { :; }\npost() { :; }\n',
   );
+  writeFileSync(
+    join(dir, 'scenarios', 'scn-a', 'checks-manifest.json'),
+    JSON.stringify({ schema_version: 1, entries: [] }),
+  );
   mkdirSync(join(dir, 'src', 'cli'), { recursive: true });
   writeFileSync(
     join(dir, 'src', 'cli', 'index.ts'),
@@ -145,7 +149,7 @@ const EXPERIMENT_SUITE_RAW = [
   'name: finite_comparison',
   'reserve: 1',
   'max_exposure_skew: 30',
-  'attempt_bounds: { max_attempts: 2, max_time_s: 300 }',
+  'attempt_bounds: { max_attempts: 2, max_time_s: 5400 }',
   'grader: { credential: cred_g, model: test-model }',
   'comparisons:',
   '  - baseline: arm_a',
@@ -236,3 +240,32 @@ export {
   FAKE_PROBE,
   probeRunner,
 };
+
+export function comparisonRegisterArgs(): ExperimentRegisterArgs {
+  const args = experimentRegisterArgs();
+  const superpowers = gauntletRepo();
+  git(superpowers.dir, ['tag', 'release']);
+  writeFileSync(join(superpowers.dir, 'README.md'), 'candidate fixture\n');
+  git(superpowers.dir, ['commit', '-qam', 'candidate']);
+  git(superpowers.dir, ['update-ref', 'refs/remotes/origin/dev', 'HEAD']);
+  const suiteRaw = args.suiteRaw
+    .replace('baseline: arm_a', 'baseline: baseline')
+    .replace('treatment: arm_b', 'treatment: candidate');
+  mkdirSync(join(args.evalsCheckout, 'suites'));
+  const suitePath = join(args.evalsCheckout, 'suites/comparison.yaml');
+  writeFileSync(suitePath, suiteRaw);
+  git(args.evalsCheckout, ['add', 'suites/comparison.yaml']);
+  git(args.evalsCheckout, ['commit', '-qm', 'comparison template']);
+  return {
+    ...args,
+    suitePath,
+    suiteRaw,
+    evalsRef: git(args.evalsCheckout, ['rev-parse', 'HEAD']),
+    superpowersCheckout: superpowers.dir,
+    comparisonInput: {
+      baseline: 'release',
+      candidate: 'dev',
+      pairs: [{ agent: 'claude', credential: 'cred_a' }],
+    },
+  };
+}

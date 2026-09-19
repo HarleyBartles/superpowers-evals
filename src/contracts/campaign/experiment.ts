@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { EffortLevelSchema } from '../effort.ts';
 import { FiniteNumberSchema } from '../finite.ts';
 import {
   CampaignComparisonSchema,
@@ -7,10 +8,65 @@ import {
   EstimateSchema,
   ExecutionSurfaceArmSchema,
 } from './campaign.ts';
+import {
+  MeasurementRequirementsSchema,
+  QualificationCoverageSchema,
+} from './measurement.ts';
 import { ID_COMPONENT_RE, SuiteSchema } from './suite.ts';
 
 export type { Suite } from './suite.ts';
 export { SuiteSchema } from './suite.ts';
+
+export const PairingSchema = z
+  .object({
+    agent: z.string().trim().min(1),
+    credential: z.string().trim().min(1),
+    effort: EffortLevelSchema.optional(),
+  })
+  .strict()
+  .transform(({ agent, credential, effort }) => ({
+    agent,
+    credential,
+    ...(effort === undefined ? {} : { effort }),
+  }));
+const PairsSchema = z
+  .array(PairingSchema)
+  .min(1)
+  .superRefine((pairs, ctx) => {
+    const keys = pairs.map((pair) =>
+      JSON.stringify([pair.agent, pair.credential, pair.effort ?? null]),
+    );
+    if (new Set(keys).size !== keys.length)
+      ctx.addIssue({ code: 'custom', message: 'duplicate pairing' });
+  });
+export const ComparisonInputSchema = z
+  .object({
+    baseline: z.string().min(1),
+    candidate: z.string().min(1),
+    pairs: PairsSchema,
+    baselineLabel: z.string().min(1).optional(),
+    candidateLabel: z.string().min(1).optional(),
+  })
+  .strict()
+  .transform(
+    ({ baseline, candidate, pairs, baselineLabel, candidateLabel }) => ({
+      baseline,
+      candidate,
+      pairs,
+      ...(baselineLabel === undefined ? {} : { baselineLabel }),
+      ...(candidateLabel === undefined ? {} : { candidateLabel }),
+    }),
+  );
+const RevisionSchema = z
+  .object({ label: z.string().min(1), sha: z.string().regex(/^[0-9a-f]{40}$/) })
+  .strict();
+export const ResolvedComparisonInputSchema = z
+  .object({
+    baseline: RevisionSchema,
+    candidate: RevisionSchema,
+    pairs: PairsSchema,
+  })
+  .strict();
 
 export const IdSchema = z.string().min(1);
 export const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
@@ -66,12 +122,37 @@ export const ExperimentCellSchema = z
     coupling: z.enum(COUPLING_CLASSES),
   })
   .strict();
+const BudgetMillisecondsSchema = z.number().int().positive().max(2147483647);
+export const RoleBudgetSchema = z
+  .object({
+    subject_ms: BudgetMillisecondsSchema,
+    assessment_ms: BudgetMillisecondsSchema.nullable(),
+    assessment_report_grace_ms: BudgetMillisecondsSchema.nullable(),
+    overhead_ms: z.literal(900000),
+  })
+  .strict()
+  .superRefine((budget, ctx) => {
+    if (
+      (budget.assessment_ms === null) !==
+        (budget.assessment_report_grace_ms === null) ||
+      (budget.assessment_ms !== null &&
+        budget.assessment_ms <= (budget.assessment_report_grace_ms ?? 0) + 5000)
+    )
+      ctx.addIssue({
+        code: 'custom',
+        message: 'invalid assessment role budget',
+      });
+  });
 export const ExperimentSchema = z
   .object({
     schema_version: z.literal(2),
     campaign_id: IdSchema,
     input_digest: Sha256Schema,
     suite: SuiteSchema,
+    comparison_request: ResolvedComparisonInputSchema.extend({
+      suite_path: z.string().min(1),
+      suite_sha256: Sha256Schema,
+    }).optional(),
     refs: z
       .object({
         superpowers_by_arm: z.record(
@@ -86,7 +167,12 @@ export const ExperimentSchema = z
       })
       .strict(),
     grader: GraderSchema,
+    measurement_requirements: MeasurementRequirementsSchema.optional(),
+    assessment_qualification: QualificationCoverageSchema.optional(),
     cells: z.array(ExperimentCellSchema).min(1),
+    role_budgets: z
+      .record(IdSchema, z.record(NameSchema, RoleBudgetSchema))
+      .optional(),
     excluded_cells: z.array(
       z.object({ cell: IdSchema, reason: IdSchema }).strict(),
     ),
@@ -210,7 +296,40 @@ export const ExperimentSchema = z
       )
         issue('primary block must contain exactly its coherent arm inventory');
     }
+    if (experiment.role_budgets !== undefined) {
+      const budgetKeys = experiment.cells.map(
+        (cell) => `${cell.comparison_id}:${cell.scenario}`,
+      );
+      if (
+        Object.keys(experiment.role_budgets).length !== budgetKeys.length ||
+        Object.keys(experiment.role_budgets).some(
+          (key) => !budgetKeys.includes(key),
+        )
+      )
+        issue('role budgets must match frozen cells');
+    }
     for (const cell of experiment.cells) {
+      if (experiment.role_budgets !== undefined) {
+        const budgets =
+          experiment.role_budgets[`${cell.comparison_id}:${cell.scenario}`];
+        if (
+          !budgets ||
+          Object.keys(budgets).length !== cell.arms.length ||
+          Object.keys(budgets).some((arm) => !cell.arms.includes(arm))
+        )
+          issue('role budgets must match cell arms');
+        for (const arm of cell.arms) {
+          const budget = budgets?.[arm];
+          if (
+            !budget ||
+            budget.subject_ms +
+              (budget.assessment_ms ?? 0) +
+              budget.overhead_ms >
+              experiment.runtime_limits.max_time_s * 1000
+          )
+            issue('attempt bound cannot accommodate frozen role budgets');
+        }
+      }
       const arms = comparisons.get(cell.comparison_id);
       if (
         !arms ||

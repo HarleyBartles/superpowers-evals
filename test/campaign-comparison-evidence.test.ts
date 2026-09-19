@@ -15,6 +15,7 @@ import {
   readPublishedArtifactBytes,
 } from '../src/campaign/attempt-publish.ts';
 import {
+  measureAttempt,
   readAttemptEvidence,
   readBlockValidity,
 } from '../src/campaign/report-evidence.ts';
@@ -40,6 +41,7 @@ afterEach(() => {
 function publication(
   patch: Record<string, unknown> = {},
   usage: unknown = undefined,
+  files: Record<string, unknown> = {},
 ) {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), 'comparison-evidence-')),
@@ -87,6 +89,11 @@ function publication(
     join(runDir, 'coding-agent-workdir', 'binary.bin'),
     Buffer.from([0xff, 0x80, 0x00, 0x42]),
   );
+  for (const [path, body] of Object.entries(files)) {
+    const dest = join(runDir, path);
+    mkdirSync(join(dest, '..'), { recursive: true });
+    writeFileSync(dest, JSON.stringify(body));
+  }
   writeAttemptManifest(runDir, intent.identity);
   const published = publishExecution({
     bound: { intent, container_id: 'a'.repeat(64) },
@@ -142,6 +149,48 @@ test('invalid optional role price and run duration leave independently valid gra
   expect(e.grader_cost_usd).toBe(0.7);
   expect(e.wall_seconds).toBeNull();
   expect(e.observed_outcome).toBe('pass');
+});
+test.each([
+  false,
+  true,
+])('assessment request accounting complete=%s survives publication into campaign costs', (complete) => {
+  const p = publication({
+    economics: {
+      coding_agent: {
+        est_cost_usd: 2,
+        has_unpriced_model: false,
+        tokens: { total: 42 },
+      },
+      gauntlet: {
+        est_cost_usd: 0.2,
+        has_unpriced_model: false,
+        tokens: { total: 20 },
+        obol: { unpriced_models: [] },
+      },
+      assessment_accounting: {
+        logicalResponses: 4,
+        physicalAttempts: complete ? 4 : 5,
+        unknownUsageAttemptIds: complete ? [] : ['005'],
+        complete,
+        error: null,
+      },
+      partial: !complete,
+      total_est_cost_usd: complete ? 2.2 : null,
+    },
+  });
+  const e = readAttemptEvidence(p);
+  expect(e.publication_valid).toBe(true);
+  expect(e.observed_outcome).toBe('pass');
+  expect(e.subject_cost_usd).toBe(2);
+  expect(e.subject_cost_complete).toBe(true);
+  expect(e.grader_cost_usd).toBe(0.2);
+  expect(e.grader_cost_complete).toBe(complete);
+  expect(e.missingness.some((m) => m.field === 'grader_tokens')).toBe(
+    !complete,
+  );
+  expect(e.missingness.some((item) => item.field === 'grader_cost_usd')).toBe(
+    !complete,
+  );
 });
 test('corrupt shared verdict bytes lose every verdict value; independent frozen usage survives', () => {
   const p = publication(
@@ -386,4 +435,407 @@ test('non-manifest reference path, digest and byte-count failures preserve indep
     expect(e.grader_cost_usd).toBeNull();
     expect(e.observed_outcome).toBeNull();
   }
+});
+
+test('conversation records require their own authenticated bytes and survive assessment timeout', () => {
+  const conversation = {
+    status: 'completed' as const,
+    endpoint: 'delivery' as const,
+    reason: 'delivered',
+    timestamp: fixtureTime(5),
+    evidence: { path: 'visible.json', quote: 'done' },
+  };
+  const p = publication({ final: 'indeterminate', gauntlet: null }, undefined, {
+    'conversation.json': conversation,
+    'visible.json': { text: 'done' },
+  });
+  expect(readAttemptEvidence(p).conversation).toEqual(conversation);
+  writeFileSync(join(p.runDir, 'conversation.json'), '{}');
+  expect(readAttemptEvidence(p).conversation).toBeNull();
+  expect(readAttemptEvidence(p).subject_cost_usd).toBe(2);
+});
+
+function conversationPublication(
+  completed: boolean,
+  completionPatch: Record<string, unknown> = {},
+  resultPatch: Record<string, unknown> = {},
+  additionalFiles: Record<string, unknown> = {},
+) {
+  const run = 'review_20260904T000000Z_abcd';
+  const out = `assessment/${run}`;
+  const checks = [
+    {
+      phase: 'post',
+      check: 'file-exists',
+      args: ['answer'],
+      negated: false,
+      passed: true,
+      checker_status: 'completed',
+      detail: null,
+    },
+  ];
+  const result = {
+    runId: run,
+    scenario: 'review',
+    status: 'pass',
+    summary: 'done',
+    reasoning: 'complete report',
+    criteria: [
+      {
+        criterion: 'Trace claim',
+        verdict: 'pass',
+        evidence: 'native invocation',
+      },
+      {
+        criterion: 'Grounded delivery',
+        verdict: 'pass',
+        evidence: 'supplied source and delivered review',
+      },
+    ],
+  };
+  Object.assign(result, resultPatch);
+  const role = {
+    out_dir: out,
+    model: 'grader',
+    started_at: fixtureTime(0),
+    finished_at: fixtureTime(9),
+    process_exit: { code: 0, signal: null },
+    stop_cause: null,
+  };
+  const files = {
+    'conversation.json': {
+      status: 'completed',
+      endpoint: 'delivery',
+      reason: 'done',
+      timestamp: fixtureTime(5),
+      evidence: { path: 'visible.json', quote: 'delivered' },
+    },
+    'gauntlet-roles.json': {
+      conversation: { ...role, out_dir: 'conversation/run' },
+      assessment: { ...role, stop_cause: completed ? null : 'timed_out' },
+    },
+    'visible.json': { text: 'delivered' },
+    'evidence/checks.json': checks,
+    'evidence/trajectory.json': {
+      schema_version: 'ATIF-v1.7',
+      agent: { name: 'fixture', version: '1' },
+      steps: [{ step_id: 1, source: 'agent', message: 'invoked' }],
+    },
+    'evidence/native/session.json': { text: 'invoked' },
+    'evidence/output/source.txt': { text: 'source' },
+    [`${out}/result.json`]: result,
+    [`${out}/assessment-completion.json`]: {
+      schema_version: 1,
+      run_id: run,
+      status: completed ? 'completed' : 'timed_out',
+      reason: 'fixture terminal state',
+      terminal_at: fixtureTime(9),
+      accepted_report_sha256: completed
+        ? sha256Hex(JSON.stringify(result))
+        : null,
+      ...completionPatch,
+    },
+  };
+  const p = publication(
+    { final: 'indeterminate', gauntlet: null, checks },
+    undefined,
+    { ...files, ...additionalFiles },
+  );
+  const requirements = {
+    mode: 'conversation' as const,
+    story_sha256: 'a'.repeat(64),
+    rubric_sha256: 'b'.repeat(64),
+    check_manifest_sha256: 'c'.repeat(64),
+    criteria: [
+      {
+        id: 'review:1',
+        ordinal: 1,
+        text: 'Trace claim',
+        required_artifact_classes: ['normalized_trace' as const],
+        check_refs: [],
+      },
+      {
+        id: 'review:2',
+        ordinal: 2,
+        text: 'Grounded delivery',
+        required_artifact_classes: [
+          'visible_delivery' as const,
+          'output' as const,
+        ],
+        check_refs: [],
+      },
+    ],
+    checks: [
+      {
+        ordinal: 0,
+        phase: 'post' as const,
+        check: 'file-exists',
+        args: ['answer'],
+        negated: false,
+        count: 1,
+        authority: { kind: 'output_check' as const, sources: ['checks.sh'] },
+      },
+    ],
+  };
+  return { p, requirements, out };
+}
+test('completed interaction and successful output checks survive a timed-out assessment publication', () => {
+  const { p, requirements } = conversationPublication(false);
+  const e = readAttemptEvidence(p);
+  const m = measureAttempt(e, requirements);
+  expect(m.interaction.verdict).toBe('pass');
+  expect(m.checks.map((c) => c.verdict)).toEqual(['pass']);
+  expect(m.criteria.map((c) => c.verdict)).toEqual([null, null]);
+  expect(e.subject_cost_usd).toBe(2);
+});
+test('trajectory corruption loses only dependent claims; manifest identity corruption loses every attribution', () => {
+  const { p, requirements } = conversationPublication(true);
+  expect(
+    measureAttempt(readAttemptEvidence(p), requirements).criteria.map(
+      (c) => c.verdict,
+    ),
+  ).toEqual(['pass', 'pass']);
+  writeFileSync(join(p.runDir, 'evidence/trajectory.json'), 'corrupted');
+  const m = measureAttempt(readAttemptEvidence(p), requirements);
+  expect(m.criteria.map((c) => c.verdict)).toEqual([null, 'pass']);
+  expect(m.checks[0]!.verdict).toBe('pass');
+  const missing = readAttemptEvidence({
+    ...p,
+    expectedIdentity: { ...p.expectedIdentity, sample_id: 'foreign' },
+  });
+  expect(
+    measureAttempt(missing, requirements).criteria.map((c) => c.verdict),
+  ).toEqual([null, null]);
+  expect(measureAttempt(missing, requirements).checks[0]!.verdict).toBeNull();
+});
+
+test('a malformed completed marker cannot authenticate accepted criterion rows', () => {
+  const { p, requirements } = conversationPublication(true, {
+    terminal_at: 'not-a-time',
+  });
+  expect(
+    measureAttempt(readAttemptEvidence(p), requirements).criteria.map(
+      (c) => c.verdict,
+    ),
+  ).toEqual([null, null]);
+});
+
+test('an authenticated process check loses its claim when the normalization evidence is damaged', () => {
+  const { p, requirements } = conversationPublication(true);
+  const processRequirements = {
+    ...requirements,
+    checks: requirements.checks.map((c) => ({
+      ...c,
+      authority: { ...c.authority, kind: 'process_check' as const },
+    })),
+  };
+  writeFileSync(join(p.runDir, 'evidence/trajectory.json'), 'corrupted');
+  expect(
+    measureAttempt(readAttemptEvidence(p), processRequirements).checks[0]!
+      .verdict,
+  ).toBeNull();
+});
+
+test('retained false check rows count only with authenticated completed phase evidence', () => {
+  const { requirements } = conversationPublication(false);
+  const checks = [
+    {
+      phase: 'post',
+      check: 'file-exists',
+      args: ['answer'],
+      negated: false,
+      passed: false,
+      detail: 'absent',
+    },
+  ];
+  expect(
+    measureAttempt(
+      readAttemptEvidence(publication({ checks, error: null })),
+      requirements,
+    ).checks[0]!.verdict,
+  ).toBe('fail');
+  expect(
+    measureAttempt(
+      readAttemptEvidence(
+        publication({ checks, error: { stage: 'checks', message: 'crash' } }),
+      ),
+      requirements,
+    ).checks[0]!.verdict,
+  ).toBeNull();
+});
+
+test('completed report status must agree with its accepted detailed criteria', () => {
+  const { p, requirements } = conversationPublication(
+    true,
+    {},
+    { status: 'fail' },
+  );
+  expect(
+    measureAttempt(readAttemptEvidence(p), requirements).criteria.map(
+      (c) => c.verdict,
+    ),
+  ).toEqual([null, null]);
+});
+
+test('the expected-check multiset never spends one literal record twice through a wildcard', () => {
+  const { p, requirements } = conversationPublication(false);
+  const base = requirements.checks[0]!;
+  const obligations = {
+    ...requirements,
+    checks: [
+      { ...base, ordinal: 0, args: null },
+      { ...base, ordinal: 1 },
+    ],
+  };
+  const rows = measureAttempt(readAttemptEvidence(p), obligations).checks;
+  expect(rows.find((r) => r.id === 'check:0')!.verdict).toBeNull();
+  expect(rows.find((r) => r.id === 'check:1')!.verdict).toBe('pass');
+});
+
+test.each([
+  'missing',
+  'corrupt',
+] as const)('%s visible evidence cannot be replaced by an authenticated same-suffix workdir file', (damage) => {
+  const { p, requirements } = conversationPublication(
+    true,
+    {},
+    {},
+    {
+      'coding-agent-workdir/visible.json': { text: 'candidate alias' },
+    },
+  );
+  const visible = p.artifacts.find(
+    (r) => r.path.split('/').length === 2 && r.path.endsWith('/visible.json'),
+  )!;
+  if (damage === 'missing')
+    p.artifacts = p.artifacts.filter((r) => r !== visible);
+  else writeFileSync(join(p.resultsRoot, visible.path), 'corrupted');
+  const evidence = readAttemptEvidence(p);
+  expect(evidence.publication_valid).toBe(true);
+  expect(
+    evidence.artifacts.some((r) =>
+      r.path.endsWith('/coding-agent-workdir/visible.json'),
+    ),
+  ).toBe(true);
+  const measured = measureAttempt(evidence, requirements);
+  expect(measured.interaction.verdict).toBeNull();
+  expect(measured.criteria.map((r) => r.verdict)).toEqual(['pass', null]);
+  expect(measured.checks[0]!.verdict).toBe('pass');
+});
+
+test('supporting evidence links use exact attempt-root files without nested suffix aliases', () => {
+  const { p, requirements } = conversationPublication(
+    true,
+    {},
+    {},
+    {
+      'coding-agent-workdir/conversation.json': {},
+      'coding-agent-workdir/evidence/checks.json': [],
+      'coding-agent-workdir/verdict.json': {},
+    },
+  );
+  const measured = measureAttempt(readAttemptEvidence(p), requirements);
+  const run = p.artifacts[0]!.path.split('/')[0]!;
+  expect(measured.interaction.evidence.map((r) => r.path)).toEqual([
+    `${run}/conversation.json`,
+    `${run}/visible.json`,
+  ]);
+  expect(measured.checks[0]!.evidence.map((r) => r.path)).toEqual([
+    `${run}/evidence/checks.json`,
+  ]);
+  const legacy = readAttemptEvidence(p);
+  legacy.assessment_report = null;
+  const qa = measureAttempt(legacy, { ...requirements, mode: 'qa' });
+  expect(
+    qa.criteria[0]!.evidence.filter((r) =>
+      r.path.endsWith('/verdict.json'),
+    ).map((r) => r.path),
+  ).toEqual([`${run}/verdict.json`]);
+});
+
+test('exact check entries consume only their declared count before allocating wildcard records', () => {
+  const { p, requirements } = conversationPublication(false);
+  const evidence = readAttemptEvidence(p);
+  const record = evidence.checks![0]!;
+  const base = requirements.checks[0]!;
+  evidence.checks = [{ ...record }, { ...record }];
+  const measured = measureAttempt(evidence, {
+    ...requirements,
+    checks: [
+      { ...base, ordinal: 0, args: null },
+      { ...base, ordinal: 1 },
+    ],
+  });
+  expect(measured.checks.map((r) => r.verdict)).toEqual(['pass', 'pass']);
+});
+
+test('criterion check dependencies require the declared checker records without inferring their verdict', () => {
+  const { requirements } = conversationPublication(false);
+  const spec = {
+    ...requirements,
+    mode: 'qa' as const,
+    criteria: [
+      {
+        ...requirements.criteria[0]!,
+        required_artifact_classes: ['check_dispositions' as const],
+        check_refs: [{ ordinal: 0, scope: 'Output existence only' }],
+      },
+    ],
+  };
+  const gauntlet = {
+    status: 'pass',
+    summary: 's',
+    reasoning: 'r',
+    run_id: 'g',
+    criteria: [
+      {
+        criterion: 'Trace claim',
+        verdict: 'pass',
+        evidence: 'accepted explanation',
+      },
+    ],
+  };
+  expect(
+    measureAttempt(
+      readAttemptEvidence(publication({ gauntlet, checks: [] })),
+      spec,
+    ).criteria[0]!.verdict,
+  ).toBeNull();
+  const checks = [
+    {
+      phase: 'post',
+      check: 'file-exists',
+      args: ['answer'],
+      negated: false,
+      passed: false,
+      checker_status: 'completed',
+      detail: 'absent',
+    },
+  ];
+  expect(
+    measureAttempt(readAttemptEvidence(publication({ gauntlet, checks })), spec)
+      .criteria[0]!.verdict,
+  ).toBe('pass');
+});
+
+test('conversation assessment still refuses shortened labels despite a valid accepted marker', () => {
+  const { p, requirements } = conversationPublication(
+    true,
+    {},
+    {
+      criteria: [
+        { criterion: 'Trace', verdict: 'pass', evidence: 'native invocation' },
+        {
+          criterion: 'Delivery',
+          verdict: 'pass',
+          evidence: 'supplied source and delivered review',
+        },
+      ],
+    },
+  );
+  const evidence = readAttemptEvidence(p);
+  expect(evidence.assessment_report).not.toBeNull();
+  expect(
+    measureAttempt(evidence, requirements).criteria.map((c) => c.verdict),
+  ).toEqual([null, null]);
 });

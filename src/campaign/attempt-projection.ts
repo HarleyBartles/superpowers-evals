@@ -16,6 +16,7 @@ import {
   selectAgentEnv,
   writePinnedFile,
 } from '../appliance/credential-scope.ts';
+import { sha256Hex } from '../contracts/campaign/digest.ts';
 import { type Grader, GraderSchema } from '../contracts/campaign/experiment.ts';
 import type { Credential } from '../contracts/credential.ts';
 import {
@@ -29,8 +30,7 @@ import {
   sharesMantleCredentialSource,
 } from '../credentials/scope.ts';
 
-// passwd fields cannot contain the colons carried in campaign attempt paths.
-// The container binds this home alias to the existing private attempt home.
+// The container binds this fixed home alias to each attempt's private home.
 export const ATTEMPT_PASSWD_HOME = '/home/quorum';
 
 export class AttemptProjectionError extends Error {
@@ -80,6 +80,7 @@ function assertAttemptId(attemptId: string): void {
     attemptId === '' ||
     attemptId === '.' ||
     attemptId === '..' ||
+    !attemptId.isWellFormed() ||
     attemptId.includes('/') ||
     attemptId.includes('\\') ||
     attemptId.includes('\0') ||
@@ -126,6 +127,7 @@ export function prepareAttemptStage(
   args: PrepareAttemptStageArgs,
 ): PreparedAttemptStage {
   assertAttemptId(args.attemptId);
+  const attemptPathComponent = `attempt-${sha256Hex(args.attemptId)}`;
 
   const registry =
     args.grader === undefined
@@ -285,7 +287,7 @@ export function prepareAttemptStage(
       safeEnvValue(line.slice(eq + 1), 'grader env value', args.attemptId);
     }
 
-    const attemptDir = join(args.campaignDir, 'attempts', args.attemptId);
+    const attemptDir = join(args.campaignDir, 'attempts', attemptPathComponent);
     const stageDir = join(attemptDir, '.stage');
     const homeDir = join(attemptDir, 'home');
     const stagingDir = join(attemptDir, 'staging');
@@ -306,7 +308,7 @@ export function prepareAttemptStage(
       );
       attemptPin = createAndPinChild(
         attemptsPin,
-        args.attemptId,
+        attemptPathComponent,
         'attempt directory',
       );
       homePin = createAndPinChild(attemptPin, 'home', 'attempt home');

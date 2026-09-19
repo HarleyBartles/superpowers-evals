@@ -17,6 +17,7 @@ import {
   type ScenarioIntake,
 } from '../src/campaign/registration.ts';
 import type { Arm } from '../src/contracts/campaign/arm.ts';
+import { ExperimentSchema } from '../src/contracts/campaign/experiment.ts';
 import { experimentDigest } from '../src/contracts/campaign/experiment-digest.ts';
 import type { Credential } from '../src/contracts/credential.ts';
 import {
@@ -47,7 +48,7 @@ function experimentInput(
       ],
       reserve: 1,
       max_exposure_skew: 30,
-      attempt_bounds: { max_attempts: 2, max_time_s: 300 },
+      attempt_bounds: { max_attempts: 2, max_time_s: 5400 },
     },
     arms: {
       arm_a: arm('arm_a'),
@@ -73,6 +74,7 @@ function experimentInput(
     capability: () => ({ ref: true, none: true }),
     agentOsSupport: () => ['linux'],
     agentFamily: () => 'claude',
+    agentMaxTime: () => undefined,
     campaignOs: 'linux',
     globalCap: 8,
     contention: {
@@ -513,6 +515,7 @@ function scenario(
 ): ScenarioIntake {
   return {
     name,
+    story: 'QA story',
     tier: 'full',
     requires_superpowers: false,
     coupling: 'arm-independent',
@@ -639,6 +642,7 @@ test('V2 registrations of identical inputs publish distinct IDs with equal input
   const first = registerExperimentCampaign(args);
   const second = registerExperimentCampaign(args);
 
+  expect(first.experiment.comparison_request).toBeUndefined();
   expect(first.experiment.campaign_id).not.toBe(second.experiment.campaign_id);
   expect(first.experiment.input_digest).toBe(second.experiment.input_digest);
   expect(first.campaignDir).not.toBe(second.campaignDir);
@@ -980,3 +984,439 @@ test('V2 registration refuses an effort the arm agent family cannot honor', () =
     ),
   ).toThrow(/arm arm_a effort high refused: harness pi has no effort control/);
 });
+
+import { comparisonRegisterArgs } from './fixtures/core-comparison/registration.ts';
+
+function fixtureGit(path: string, ...args: string[]): string {
+  const result = spawnSync('git', ['-C', path, ...args], { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+}
+
+test('runtime registration freezes refs once across intake passes and authenticates the template', () => {
+  const args = comparisonRegisterArgs();
+  const initial = fixtureGit(
+    args.superpowersCheckout,
+    'rev-parse',
+    'refs/remotes/origin/dev',
+  );
+  const baseline = fixtureGit(args.superpowersCheckout, 'rev-parse', 'release');
+  let moved = false;
+  const runner: CommandRunner = {
+    run(command, argv, options) {
+      if (!moved && command === 'git' && argv.includes('worktree')) {
+        fixtureGit(
+          args.superpowersCheckout,
+          'update-ref',
+          'refs/remotes/origin/dev',
+          baseline,
+        );
+        moved = true;
+      }
+      return args.runner.run(command, argv, options);
+    },
+  };
+  const result = registerExperimentCampaign({ ...args, runner });
+  expect(moved).toBe(true);
+  expect(
+    fixtureGit(
+      args.superpowersCheckout,
+      'rev-parse',
+      'refs/remotes/origin/dev',
+    ),
+  ).toBe(baseline);
+  expect(result.experiment.refs.superpowers_by_arm).toEqual({
+    p1_baseline: baseline,
+    p1_candidate: initial,
+  });
+  expect(result.experiment.comparison_request).toEqual({
+    baseline: { label: 'release', sha: baseline },
+    candidate: { label: 'dev', sha: initial },
+    pairs: [{ agent: 'claude', credential: 'cred_a' }],
+    suite_path: 'suites/comparison.yaml',
+    suite_sha256: sha256Hex(args.suiteRaw),
+  });
+  expect(
+    existsSync(join(result.campaignDir, 'evals/arms/p1_baseline.yaml')),
+  ).toBe(false);
+  expect(loadExperiment(result.campaignDir)).toEqual(result.experiment);
+});
+
+test('runtime registration refuses dirty, untracked, outside and snapshot-substituted templates', () => {
+  const args = comparisonRegisterArgs();
+  expect(() =>
+    registerExperimentCampaign({
+      ...args,
+      suiteRaw: `${args.suiteRaw}# changed\n`,
+    }),
+  ).toThrow(/suite.*bytes|template/i);
+  writeFileSync(args.suitePath, `${args.suiteRaw}# dirty\n`);
+  expect(() => registerExperimentCampaign(args)).toThrow(
+    /suite.*bytes|template/i,
+  );
+  writeFileSync(args.suitePath, args.suiteRaw);
+  const untracked = join(args.evalsCheckout, 'suites/untracked.yaml');
+  writeFileSync(untracked, args.suiteRaw);
+  expect(() =>
+    registerExperimentCampaign({ ...args, suitePath: untracked }),
+  ).toThrow();
+  const outside = join(args.campaignsRoot, 'outside.yaml');
+  writeFileSync(outside, args.suiteRaw);
+  expect(() =>
+    registerExperimentCampaign({ ...args, suitePath: outside }),
+  ).toThrow(/outside/);
+  const runner: CommandRunner = {
+    run(command, argv, options) {
+      const result = args.runner.run(command, argv, options);
+      if (
+        command === 'bun' &&
+        argv.includes('install') &&
+        options?.cwd?.endsWith('/evals')
+      ) {
+        writeFileSync(
+          join(options.cwd, 'suites/comparison.yaml'),
+          `${args.suiteRaw}# corrupt\n`,
+        );
+      }
+      return result;
+    },
+  };
+  expect(() => registerExperimentCampaign({ ...args, runner })).toThrow(
+    /drifted|snapshot/,
+  );
+});
+
+test('runtime identity includes labels, refs, ordered pairings, effort and exact template bytes', () => {
+  const args = comparisonRegisterArgs();
+  const original = registerExperimentCampaign(args).experiment;
+  for (const comparisonInput of [
+    { ...args.comparisonInput!, baselineLabel: 'different label' },
+    { ...args.comparisonInput!, candidate: 'release' },
+    {
+      ...args.comparisonInput!,
+      pairs: [{ agent: 'claude', credential: 'cred_b' }],
+    },
+    {
+      ...args.comparisonInput!,
+      pairs: [
+        { agent: 'claude', credential: 'cred_a', effort: 'high' as const },
+      ],
+    },
+  ]) {
+    expect(
+      registerExperimentCampaign({ ...args, comparisonInput }).experiment
+        .input_digest,
+    ).not.toBe(original.input_digest);
+  }
+  const pairs = [
+    { agent: 'claude', credential: 'cred_a' },
+    { agent: 'claude', credential: 'cred_b' },
+  ];
+  const ordered = registerExperimentCampaign({
+    ...args,
+    comparisonInput: { ...args.comparisonInput!, pairs },
+  }).experiment;
+  const reversed = registerExperimentCampaign({
+    ...args,
+    comparisonInput: { ...args.comparisonInput!, pairs: [...pairs].reverse() },
+  }).experiment;
+  expect(ordered.input_digest).not.toBe(reversed.input_digest);
+  const changed = {
+    ...original,
+    comparison_request: {
+      ...original.comparison_request!,
+      suite_sha256: sha256Hex(`${args.suiteRaw}# comment\n`),
+    },
+  };
+  expect(experimentDigest(changed)).not.toBe(original.input_digest);
+  const suiteRaw = `${args.suiteRaw}# authenticated comment\n`;
+  writeFileSync(args.suitePath, suiteRaw);
+  fixtureGit(args.evalsCheckout, 'add', 'suites/comparison.yaml');
+  fixtureGit(args.evalsCheckout, 'commit', '-qm', 'revise template bytes');
+  const revised = registerExperimentCampaign({
+    ...args,
+    suiteRaw,
+    evalsRef: fixtureGit(args.evalsCheckout, 'rev-parse', 'HEAD'),
+  }).experiment;
+  expect(revised.comparison_request?.suite_sha256).toBe(sha256Hex(suiteRaw));
+  expect(revised.input_digest).not.toBe(original.input_digest);
+  writeFileSync(args.suitePath, args.suiteRaw);
+
+  expect(() =>
+    registerExperimentCampaign({
+      ...args,
+      comparisonInput: {
+        ...args.comparisonInput!,
+        pairs: [{ agent: 'claude', credential: 'unknown' }],
+      },
+    }),
+  ).toThrow(/credential unknown/);
+}, 60000);
+
+test('role budgets resolve each arm from story then agent defaults', () => {
+  const input = experimentInput({
+    arms: { arm_a: arm('arm_a'), arm_b: arm('arm_b', { agent: 'pi' }) },
+    agentMaxTime: (agent) => (agent === 'pi' ? '20m' : '10m'),
+  });
+  expect(prepareExperimentRegistration(input).role_budgets['c1:scn-a']).toEqual(
+    {
+      arm_a: {
+        subject_ms: 600000,
+        assessment_ms: null,
+        assessment_report_grace_ms: null,
+        overhead_ms: 900000,
+      },
+      arm_b: {
+        subject_ms: 1200000,
+        assessment_ms: null,
+        assessment_report_grace_ms: null,
+        overhead_ms: 900000,
+      },
+    },
+  );
+  const withStory = {
+    ...input,
+    scenarios: [
+      scenario('scn-a', {
+        story:
+          '---\nquorum_max_time: 30m\nquorum_mode: conversation\nquorum_assessment_max_time: 10m\nquorum_assessment_report_grace: 60s\n---\n',
+      }),
+    ],
+  };
+  const budget =
+    prepareExperimentRegistration(withStory).role_budgets['c1:scn-a'];
+  for (const name of ['arm_a', 'arm_b'])
+    expect(budget?.[name]).toEqual({
+      subject_ms: 1800000,
+      assessment_ms: 600000,
+      assessment_report_grace_ms: 60000,
+      overhead_ms: 900000,
+    });
+});
+test('outer attempt bounds accommodate every arm including QA final-report headroom', () => {
+  const base = experimentInput();
+  const input = {
+    ...base,
+    suite: {
+      ...base.suite,
+      attempt_bounds: { max_attempts: 2, max_time_s: 1500 },
+    },
+  };
+  expect(
+    prepareExperimentRegistration(input).role_budgets['c1:scn-a']?.['arm_a']
+      ?.subject_ms,
+  ).toBe(600000);
+  expect(() =>
+    prepareExperimentRegistration({ ...input, agentMaxTime: () => '601s' }),
+  ).toThrow(
+    /attempt bound cannot accommodate scn-a's role budgets and overhead/,
+  );
+  expect(() =>
+    prepareExperimentRegistration({
+      ...input,
+      scenarios: [
+        scenario('scn-a', {
+          story:
+            '---\nquorum_mode: conversation\nquorum_assessment_max_time: 5m\nquorum_assessment_report_grace: 60s\n---\n',
+        }),
+      ],
+    }),
+  ).toThrow(/attempt bound cannot accommodate/);
+});
+
+test('registration freezes role budgets from committed story and agent bytes despite checkout edits', () => {
+  const args = experimentRegisterArgs();
+  const git = (argv: string[]) => {
+    const result = args.runner.run('git', ['-C', args.evalsCheckout, ...argv]);
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  const storyPath = join(args.evalsCheckout, 'scenarios/scn-a/story.md');
+  const agentPath = join(args.evalsCheckout, 'coding-agents/claude.yaml');
+  const agent = readFileSync(agentPath, 'utf8');
+  writeFileSync(
+    storyPath,
+    '---\nquorum_mode: conversation\nquorum_assessment_max_time: 5m\nquorum_assessment_report_grace: 60s\n---\nStory.\n\n## Acceptance Criteria\n\n- Deliver the requested result.\n',
+  );
+  writeFileSync(agentPath, `${agent}max_time: 20m\n`);
+  git(['add', 'scenarios/scn-a/story.md', 'coding-agents/claude.yaml']);
+  git(['commit', '-qm', 'freeze role allowances']);
+  const evalsRef = git(['rev-parse', 'HEAD']);
+  writeFileSync(
+    storyPath,
+    '---\nquorum_max_time: 1s\n---\nMutable checkout.\n',
+  );
+  writeFileSync(agentPath, `${agent}max_time: 1s\n`);
+  const result = registerExperimentCampaign({ ...args, evalsRef });
+  expect(result.experiment.role_budgets?.['c1:scn-a']?.['arm_a']).toEqual({
+    subject_ms: 1200000,
+    assessment_ms: 300000,
+    assessment_report_grace_ms: 60000,
+    overhead_ms: 900000,
+  });
+  expect(result.experiment.input_digest).toBe(
+    experimentDigest(result.experiment),
+  );
+}, 30000);
+
+test('present frozen role budgets require exact cell and arm inventory and valid bounds', () => {
+  const prepared = prepareExperimentRegistration(experimentInput());
+  const experiment = {
+    ...prepared,
+    campaign_id: 'test',
+    input_digest: '0'.repeat(64),
+    registered_at: '2026-09-10T00:00:00Z',
+    registered_by: 'test',
+  };
+  const budgets = prepared.role_budgets;
+  expect(ExperimentSchema.safeParse(experiment).success).toBe(true);
+  for (const role_budgets of [
+    {},
+    { ...budgets, extra: budgets['c1:scn-a'] },
+    { 'c1:scn-a': { arm_a: budgets['c1:scn-a']?.['arm_a'] } },
+    {
+      'c1:scn-a': {
+        ...budgets['c1:scn-a'],
+        arm_a: { ...budgets['c1:scn-a']?.['arm_a'], subject_ms: 5400000 },
+      },
+    },
+  ])
+    expect(
+      ExperimentSchema.safeParse({ ...experiment, role_budgets }).success,
+    ).toBe(false);
+  const { role_budgets: _budgets, ...retained } = experiment;
+  expect(ExperimentSchema.parse(retained).role_budgets).toBeUndefined();
+});
+
+test('registration authenticates requirements and qualification source bytes in both intake passes', () => {
+  const args = experimentRegisterArgs();
+  mkdirSync(join(args.evalsCheckout, 'dep'));
+  writeFileSync(
+    join(args.evalsCheckout, 'dep/package.json'),
+    JSON.stringify({ name: 'fixture-dep', version: '0.0.0' }),
+  );
+  writeFileSync(
+    join(args.evalsCheckout, 'package.json'),
+    JSON.stringify({
+      name: 'fixture',
+      version: '0.0.0',
+      workspaces: ['dep'],
+      dependencies: { 'fixture-dep': 'workspace:*' },
+    }),
+  );
+  const installed = args.runner.run('bun', ['install'], {
+    cwd: args.evalsCheckout,
+  });
+  if (installed.status !== 0) throw new Error(installed.stderr);
+  const story = readFileSync(
+    join(args.evalsCheckout, 'scenarios/scn-a/story.md'),
+    'utf8',
+  );
+  const manifest = readFileSync(
+    join(args.evalsCheckout, 'scenarios/scn-a/checks-manifest.json'),
+    'utf8',
+  );
+  const rubric = sha256Hex(story);
+  const requirements = JSON.stringify({
+    schema_version: 1,
+    scenarios: {
+      'scn-a': {
+        mode: 'qa',
+        story_sha256: rubric,
+        rubric_sha256: rubric,
+        criteria: [],
+        checks: [],
+        oracle_authority: { check_manifest_sha256: sha256Hex(manifest) },
+      },
+    },
+  });
+  const cases = JSON.stringify({
+    schema_version: 1,
+    assessments_per_case: 1,
+    cases: [
+      {
+        id: 'case',
+        rubric_sha256: rubric,
+        expected: [
+          {
+            criterion: 1,
+            verdict: 'pass',
+            required_reason: 'fixture expected behavior',
+          },
+        ],
+      },
+    ],
+  });
+  const qualification = JSON.stringify({
+    schema_version: 1,
+    gauntlet_sha: 'a'.repeat(40),
+    grader: {
+      credential: 'fixture',
+      model: 'fixture',
+      configuration_sha256: 'a'.repeat(64),
+    },
+    evidence_semantics_sha256: 'b'.repeat(64),
+    scopes: [
+      {
+        scenario: 'scn-a',
+        rubric_sha256: rubric,
+        criterion_ids: ['scn-a:1'],
+        assessment_ms: 300000,
+        report_grace_ms: 60000,
+        case_manifest: { path: 'cases.json', sha256: sha256Hex(cases) },
+        private_receipt_sha256: 'c'.repeat(64),
+        observations: [],
+      },
+    ],
+  });
+  for (const [path, bytes] of Object.entries({
+    'requirements.json': requirements,
+    'cases.json': cases,
+    'qualification.json': qualification,
+  }))
+    writeFileSync(join(args.evalsCheckout, path), bytes);
+  const git = (argv: string[]) => {
+    const result = args.runner.run('git', ['-C', args.evalsCheckout, ...argv]);
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git([
+    'add',
+    'requirements.json',
+    'cases.json',
+    'qualification.json',
+    'package.json',
+    'bun.lock',
+    'dep/package.json',
+  ]);
+  git(['commit', '-qm', 'freeze public measurement declarations']);
+  const evalsRef = git(['rev-parse', 'HEAD']);
+  const suiteRaw = `${args.suiteRaw}\nmeasurement_requirements:\n  path: requirements.json\n  sha256: ${sha256Hex(requirements)}\nassessment_qualification:\n  path: qualification.json\n  sha256: ${sha256Hex(qualification)}\n`;
+  const frozen = registerExperimentCampaign({
+    ...args,
+    evalsRef,
+    suiteRaw,
+  }).experiment;
+  expect(frozen.measurement_requirements?.['scn-a']?.rubric_sha256).toBe(
+    rubric,
+  );
+  expect(frozen.assessment_qualification?.scopes[0]?.status).toBe('unverified');
+  for (const path of ['requirements.json', 'cases.json', 'src/cli/index.ts']) {
+    const runner: CommandRunner = {
+      run(command, argv, options) {
+        const result = args.runner.run(command, argv, options);
+        if (
+          command === 'bun' &&
+          argv.includes('install') &&
+          options?.cwd?.startsWith(realpathSync(args.campaignsRoot)) &&
+          options.cwd.endsWith('/evals')
+        )
+          writeFileSync(join(options.cwd, path), 'tampered');
+        return result;
+      },
+    };
+    expect(() =>
+      registerExperimentCampaign({ ...args, evalsRef, suiteRaw, runner }),
+    ).toThrow(/drifted from intake bytes/);
+  }
+}, 60000);

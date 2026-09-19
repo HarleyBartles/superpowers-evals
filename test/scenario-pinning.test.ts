@@ -26,14 +26,15 @@ const INTENTIONAL_PINNED_SCENARIOS = new Set<string>([
   'sdd-spec-context-consumed',
   'worktree-creation-under-pressure',
   'worktree-no-drift-to-main',
-  // Conversation assessment is initially implemented only for the Claude and
-  // Codex TUI adapters.
+  // Conversation assessment remains explicitly pinned: pricing and code review
+  // also admit Pi for qualification, while the others stay Claude/Codex-only.
   'conversation-pricing',
   'conversation-code-review',
   'conversation-design',
   'conversation-debugging',
   'conversation-review-feedback',
   'conversation-verification',
+  'conversation-config-repair',
   // Builder campaign fixture: intentionally limited to the Serf harness and
   // Linux, where its Go toolchain and SDD subagent workflow are validated.
   'serf-builder-fractals',
@@ -121,4 +122,21 @@ test('harness pins are exactly the explicitly intentional scenarios', () => {
     }
   }
   expect(pinned).toEqual(INTENTIONAL_PINNED_SCENARIOS);
+});
+
+test('only pricing and code review conversation scenarios admit Pi', () => {
+  const scenarioRoot = join(repoRoot(), 'scenarios');
+  const piScenarios = new Set(
+    readdirSync(scenarioRoot)
+      .filter((entry) => entry.startsWith('conversation-'))
+      .filter((entry) =>
+        parseCodingAgentsDirective(
+          join(scenarioRoot, entry, 'checks.sh'),
+        )?.includes('pi'),
+      ),
+  );
+
+  expect(piScenarios).toEqual(
+    new Set(['conversation-code-review', 'conversation-pricing']),
+  );
 });

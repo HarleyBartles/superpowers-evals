@@ -12,7 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ProvisionError } from '../src/agents/index.ts';
-import { PiAgent } from '../src/agents/pi.ts';
+import { PiAgent, piCustomProviderContext } from '../src/agents/pi.ts';
 import type { AgentConfig } from '../src/contracts/agent-config.ts';
 import type { Credential } from '../src/contracts/credential.ts';
 import { makeTempHome } from './provision-helpers.ts';
@@ -295,7 +295,7 @@ test('api-key credential: models.json is mode 0600 and auth.json carries resolve
   }
 });
 
-test('api-key credential: settings.json uses credential.model and quorum provider', () => {
+test('api-key credential: settings pin the model and captured session directory', () => {
   const { home, cleanup } = makeTempHome();
   const sp = makeSuperpowersRoot();
   const credential = makeApiKeyCredential();
@@ -313,6 +313,9 @@ test('api-key credential: settings.json uses credential.model and quorum provide
           defaultProvider: 'quorum',
           defaultModel: 'glm-5.2-fp8',
           defaultThinkingLevel: 'medium',
+          // Pi must not encode a potentially >255-byte campaign cwd into one
+          // filename. Its native sessionDir setting bypasses that default.
+          sessionDir: join(home.configDir, 'sessions'),
         });
       },
     );
@@ -728,6 +731,7 @@ test('oauth credential: seeds host auth.json and uses credential.model', () => {
           defaultProvider: 'openai-codex',
           defaultModel: 'gpt-5.5-override',
           defaultThinkingLevel: 'medium',
+          sessionDir: join(home.configDir, 'sessions'),
         });
 
         // pi.env carries provider/model, NO PI_API_KEY.
@@ -827,30 +831,6 @@ test('subscription credential throws ProvisionError', () => {
   }
 });
 
-// Guards the HOME isolation + PI_CODING_AGENT_DIR collapse: the pi launch-agent
-// template pins HOME/XDG/TMPDIR via $QUORUM_HOME_ENV and sources pi.env, but it
-// does NOT set PI_CODING_AGENT_DIR and passes NO --session-dir. pi defaults its
-// config dir to $HOME/.pi/agent and its session dir to <config>/sessions, which
-// is where the runner seeds the per-run config (pi.yaml: home_config_subdir
-// ".pi/agent") — so pi finds it all via the isolated $HOME.
-test('pi launch-agent isolates HOME, omits PI_CODING_AGENT_DIR and --session-dir', () => {
-  const launcher = readFileSync(
-    join(import.meta.dir, '..', 'coding-agents', 'pi-context', 'launch-agent'),
-    'utf8',
-  );
-  // HOME/XDG/TMPDIR isolation comes from the shared $QUORUM_HOME_ENV token.
-  expect(launcher).toContain('$QUORUM_HOME_ENV');
-  // PI_CODING_AGENT_DIR is collapsed into $HOME — the launcher must NOT set it as
-  // an env assignment on the exec line (the comment block may still mention it).
-  expect(launcher).not.toContain('PI_CODING_AGENT_DIR="$PI_CODING_AGENT_DIR"');
-  // No explicit --session-dir flag: pi nests sessions under its $HOME default.
-  // Asserts the flag-invocation form, which (unlike the bare name in prose) only
-  // ever appears on the exec line.
-  expect(launcher).not.toContain(
-    '--session-dir "$PI_CODING_AGENT_DIR/sessions"',
-  );
-});
-
 // ---------------------------------------------------------------------------
 // Kernel D2: home.superpowers threading (root / none / legacy undefined).
 // ---------------------------------------------------------------------------
@@ -925,4 +905,27 @@ test('superpowers undefined spec keeps the legacy missing-root ProvisionError', 
   } finally {
     cleanup();
   }
+});
+
+// Pi records a placeholder zero cost for every model served through the custom
+// provider that api-key provisioning registers, whatever the endpoint. Capture
+// needs that provider/model pair to reprice from token buckets; an OAuth login
+// uses pi's own provider rates and gets no policy.
+test('piCustomProviderContext names the quorum provider for every api-key route and nothing for oauth', () => {
+  expect(piCustomProviderContext(makeApiKeyCredential())).toEqual({
+    pi: {
+      placeholderZeroCost: {
+        provider: 'quorum',
+        model: 'glm-5.2-fp8',
+        policy: 'unconfigured-provider-model-rates',
+      },
+    },
+  });
+  expect(
+    piCustomProviderContext(
+      makeApiKeyCredential({ model: 'gpt-5.6-sol', api: 'openai-responses' }),
+    )?.pi?.placeholderZeroCost?.model,
+  ).toBe('gpt-5.6-sol');
+  expect(piCustomProviderContext(makeOauthCredential())).toBeUndefined();
+  expect(piCustomProviderContext(undefined)).toBeUndefined();
 });

@@ -1,5 +1,6 @@
 // Registration authenticates object-store inputs against the materialized snapshot,
 // freezes finite work and resource policy, and publishes the document after its journal anchor.
+
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
@@ -9,7 +10,7 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { CommandRunner } from '../agents/command-runner.ts';
 import { superpowersCapability } from '../agents/index.ts';
@@ -54,11 +55,24 @@ import { effortRefusal } from '../contracts/effort.ts';
 import { getEnv } from '../env.ts';
 import type { Clock } from '../scheduler/clock.ts';
 import {
+  assessmentBudgetFromStory,
   couplingFromStory,
+  durationMs,
+  quorumMaxTimeFromStory,
   quorumTierFromStory,
   requiresSuperpowersFromStory,
 } from '../story-meta.ts';
+import {
+  consumeQualificationInputs,
+  evaluateQualification,
+} from './assessment-qualification.ts';
 import { publishFrozenCampaign } from './campaign-document.ts';
+import {
+  type ComparisonInput,
+  ComparisonInputSchema,
+  materializeComparison,
+  type ResolvedComparisonInput,
+} from './comparison-input.ts';
 import {
   type CommittedTransition,
   ExecutionJournalWriter,
@@ -75,6 +89,7 @@ import {
   type JournalFsOps,
 } from './journal.ts';
 import { acquireLease, type ProcessIdentityProbe } from './locks.ts';
+import { resolveMeasurementRequirements } from './measurement-requirements.ts';
 import { verifyPricingSnapshot } from './pricing-snapshot.ts';
 import {
   assertFeasible,
@@ -202,6 +217,7 @@ export function attemptIdOf(sampleId: string, seq: number): string {
 }
 
 export interface ScenarioIntake {
+  readonly story: string;
   readonly name: string;
   readonly tier: 'sentinel' | 'full' | 'adhoc';
   readonly requires_superpowers: boolean;
@@ -225,6 +241,7 @@ export interface RegistrationInput {
   readonly scenarios: readonly ScenarioIntake[];
   readonly capability: (family: string) => { ref: boolean; none: boolean };
   readonly agentOsSupport: (agent: string) => readonly string[] | undefined;
+  readonly agentMaxTime: (agent: string) => string | undefined;
   readonly agentFamily: (agent: string) => string;
   readonly campaignOs: string;
   readonly globalCap: number;
@@ -236,8 +253,12 @@ export interface RegistrationInput {
 
 export type PreparedRegistration = Omit<
   Experiment,
-  'campaign_id' | 'input_digest' | 'registered_at' | 'registered_by'
->;
+  | 'campaign_id'
+  | 'input_digest'
+  | 'registered_at'
+  | 'registered_by'
+  | 'role_budgets'
+> & { role_budgets: NonNullable<Experiment['role_budgets']> };
 
 interface CredentialAuthorityProjection {
   readonly schema: 'quorum.credential-authority/v1';
@@ -423,6 +444,7 @@ export function prepareRegistration(
   );
   const normalizedComparisons: ExperimentSuite['comparisons'] = [];
   const comparisons: Experiment['comparisons'] = [];
+  const roleBudgets: Experiment['role_budgets'] = {};
   const cells: Experiment['cells'] = [];
   const excludedCells: Experiment['excluded_cells'] = [];
   const plannedSlots: Experiment['planned_slots'] = [];
@@ -556,6 +578,34 @@ export function prepareRegistration(
         continue;
       }
 
+      const budget = assessmentBudgetFromStory(scenario.story);
+      const budgets: NonNullable<Experiment['role_budgets']>[string] = {};
+      for (const armName of armNames) {
+        const arm = input.arms[armName];
+        if (arm === undefined)
+          throw new RegistrationError(`arm ${armName} is absent from arms/`);
+        const subjectMs = durationMs(
+          quorumMaxTimeFromStory(scenario.story) ??
+            input.agentMaxTime(arm.agent) ??
+            '10m',
+        );
+        // Setup, capture, checks, publication, cleanup and legacy finalReportTurn
+        // share this headroom. The outer process deadline bounds provider latency.
+        const overheadMs = 900000;
+        const assessmentMs = budget?.totalMs ?? 0;
+        const neededMs = subjectMs + assessmentMs + overheadMs;
+        if (suite.attempt_bounds.max_time_s * 1000 < neededMs)
+          throw new RegistrationError(
+            `attempt bound cannot accommodate ${scenario.name}'s role budgets and overhead`,
+          );
+        budgets[armName] = {
+          subject_ms: subjectMs,
+          assessment_ms: budget?.totalMs ?? null,
+          assessment_report_grace_ms: budget?.reportGraceMs ?? null,
+          overhead_ms: overheadMs,
+        };
+      }
+      roleBudgets[cellKey] = budgets;
       const n = comparison.cells?.[scenarioName]?.n ?? comparison.n;
       cells.push({
         scenario: scenarioName,
@@ -635,6 +685,7 @@ export function prepareRegistration(
     planned_slots: plannedSlots,
     reserve_slots: reserveSlots,
     execution_surface: executionSurface,
+    role_budgets: roleBudgets,
     credential_authority_digest: credentialAuthorityDigest(
       input.credentials,
       activeCredentialNames,
@@ -661,7 +712,7 @@ export function prepareRegistration(
     registered_by: _registeredBy,
     ...result
   } = validated;
-  return result;
+  return { ...result, role_budgets: roleBudgets };
 }
 
 /** Decision D-4 defaults (drafted for gate challenge; the parent pins the
@@ -761,6 +812,7 @@ function scenarioIntakeOf(
 ): ScenarioIntake {
   return {
     name,
+    story,
     tier: quorumTierFromStory(story),
     requires_superpowers: requiresSuperpowersFromStory(story) ?? false,
     coupling:
@@ -779,7 +831,11 @@ function scenarioIntakeOf(
  *  via plain file reads, parsed by the same string-based readers the
  *  object-store intake uses. Records every consumed file's bytes so callers
  *  can cross-check provenance. */
-export function readIntakeFromEvalsTree(evalsRoot: string): SnapshotIntake {
+export function readIntakeFromEvalsTree(
+  evalsRoot: string,
+  extraPaths: string[] = [],
+  qualification?: ExperimentSuite['assessment_qualification'],
+): SnapshotIntake {
   const arms: Record<string, Arm> = {};
   const files: Record<string, string> = {};
   const armsDir = join(evalsRoot, 'arms');
@@ -810,6 +866,12 @@ export function readIntakeFromEvalsTree(evalsRoot: string): SnapshotIntake {
       const storyPath = join(scenarioDir, 'story.md');
       if (!existsSync(storyPath)) continue;
       files[`scenarios/${entry}/story.md`] = readFileSync(storyPath, 'utf8');
+      const manifestPath = `scenarios/${entry}/checks-manifest.json`;
+      if (existsSync(join(evalsRoot, manifestPath)))
+        files[manifestPath] = readFileSync(
+          join(evalsRoot, manifestPath),
+          'utf8',
+        );
       const setupPath = join(scenarioDir, 'setup.sh');
       if (existsSync(setupPath)) {
         files[`scenarios/${entry}/setup.sh`] = readFileSync(setupPath, 'utf8');
@@ -844,6 +906,23 @@ export function readIntakeFromEvalsTree(evalsRoot: string): SnapshotIntake {
       );
     }
   }
+  for (const path of extraPaths)
+    files[path] = readFileSync(join(evalsRoot, path), 'utf8');
+  if (qualification) {
+    const paths = [
+      'package.json',
+      'bun.lock',
+      ...readdirSync(join(evalsRoot, 'src'), { recursive: true })
+        .map((p) => `src/${p}`)
+        .filter((p) => statSync(join(evalsRoot, p)).isFile()),
+    ];
+    consumeQualificationInputs({
+      files,
+      reference: qualification,
+      paths,
+      read: (path) => readFileSync(join(evalsRoot, path), 'utf8'),
+    });
+  }
   return { arms, credentials, scenarios, files };
 }
 
@@ -869,6 +948,8 @@ export function readSnapshotIntake(
   evalsCheckout: string,
   evalsSha: string,
   runner: CommandRunner,
+  extraPaths: string[] = [],
+  qualification?: ExperimentSuite['assessment_qualification'],
 ): SnapshotIntake {
   const listing = gitOutText(runner, [
     '-C',
@@ -910,6 +991,8 @@ export function readSnapshotIntake(
     const name = p.split('/')[1] ?? '';
     if (name === '') continue; // unreachable by the path regex; keeps the type sound
     const story = readAt(p);
+    const manifestPath = `scenarios/${name}/checks-manifest.json`;
+    if (paths.includes(manifestPath)) readAt(manifestPath);
     const setup = `scenarios/${name}/setup.sh`;
     const checksPath = `scenarios/${name}/checks.sh`;
     const checks = paths.includes(checksPath) ? readAt(checksPath) : undefined;
@@ -925,6 +1008,14 @@ export function readSnapshotIntake(
   for (const p of paths.filter((x) => /^coding-agents\/[^/]+\.yaml$/.test(x))) {
     readAt(p);
   }
+  for (const path of extraPaths) readAt(path);
+  if (qualification)
+    consumeQualificationInputs({
+      files,
+      reference: qualification,
+      paths,
+      read: readAt,
+    });
   return { arms, credentials, scenarios, files };
 }
 
@@ -1015,6 +1106,7 @@ function probeChildContract(
 }
 
 export interface RegisterArgs {
+  readonly comparisonInput?: ComparisonInput;
   readonly suitePath: string;
   readonly suiteRaw: string;
   readonly campaignsRoot: string;
@@ -1076,6 +1168,62 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
     args.gauntletRef,
     args.runner,
   );
+  // Resolve mutable refs before either intake pass; labels never participate in resolution.
+  let comparisonRequest: Experiment['comparison_request'];
+  if (args.comparisonInput !== undefined) {
+    const input = ComparisonInputSchema.parse(args.comparisonInput);
+    const checkout = realpathSync(args.evalsCheckout);
+    const suiteFile = realpathSync(resolve(args.suitePath));
+    const suitePath = relative(checkout, suiteFile);
+    if (
+      isAbsolute(suitePath) ||
+      suitePath === '..' ||
+      suitePath.startsWith(`..${sep}`)
+    ) {
+      throw new RegistrationError(
+        'runtime suite template is outside the evals repository',
+      );
+    }
+    const frozenBytes = gitOutText(args.runner, [
+      '-C',
+      checkout,
+      'show',
+      `${evalsSha}:${suitePath}`,
+    ]);
+    if (
+      frozenBytes !== args.suiteRaw ||
+      readFileSync(suiteFile, 'utf8') !== frozenBytes
+    ) {
+      throw new RegistrationError(
+        'runtime suite template bytes differ from the frozen evals commit',
+      );
+    }
+    const repo = { path: args.superpowersCheckout, remote: 'origin' };
+    const resolved: ResolvedComparisonInput = {
+      baseline: {
+        label: input.baselineLabel ?? input.baseline,
+        sha: resolveSuperpowersRef(repo, input.baseline, args.runner),
+      },
+      candidate: {
+        label: input.candidateLabel ?? input.candidate,
+        sha: resolveSuperpowersRef(repo, input.candidate, args.runner),
+      },
+      pairs: input.pairs,
+    };
+    comparisonRequest = {
+      ...resolved,
+      suite_path: suitePath,
+      suite_sha256: sha256Hex(frozenBytes),
+    };
+  }
+  const runtimeComparison =
+    comparisonRequest === undefined
+      ? undefined
+      : materializeComparison(suite, {
+          baseline: comparisonRequest.baseline,
+          candidate: comparisonRequest.candidate,
+          pairs: comparisonRequest.pairs,
+        });
   const now = new Date(args.nowMs).toISOString();
   const stats = args.probe.sample(args.nowMs);
   const contention = buildContentionBlock({
@@ -1090,8 +1238,10 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
   const campaignId = (args.campaignId ?? randomUUID)();
 
   const compile = (intake: SnapshotIntake): Experiment => {
+    const compiledSuite = runtimeComparison?.suite ?? suite;
+    const arms = runtimeComparison?.arms ?? intake.arms;
     const armNames = new Set<string>();
-    for (const comparison of suite.comparisons) {
+    for (const comparison of compiledSuite.comparisons) {
       if ('arm' in comparison) armNames.add(comparison.arm);
       else {
         armNames.add(comparison.baseline);
@@ -1100,22 +1250,24 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
     }
     const superpowers_by_arm: Record<string, string | null> = {};
     for (const name of [...armNames].sort()) {
-      const arm = intake.arms[name];
+      const arm = arms[name];
       if (arm === undefined) {
         throw new RegistrationError(`arm ${name} is absent from arms/`);
       }
       superpowers_by_arm[name] =
         arm.superpowers === 'none'
           ? null
-          : resolveSuperpowersRef(
-              { path: args.superpowersCheckout, remote: 'origin' },
-              arm.superpowers,
-              args.runner,
-            );
+          : runtimeComparison !== undefined
+            ? arm.superpowers
+            : resolveSuperpowersRef(
+                { path: args.superpowersCheckout, remote: 'origin' },
+                arm.superpowers,
+                args.runner,
+              );
     }
     const prepared = prepareRegistration({
-      suite,
-      arms: intake.arms,
+      suite: compiledSuite,
+      arms,
       credentials: intake.credentials,
       grader,
       refs: {
@@ -1125,6 +1277,7 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
       },
       scenarios: intake.scenarios,
       capability: (family) => superpowersCapability(family),
+      agentMaxTime: (agent) => intakeAgentConfig(intake, agent).max_time,
       agentOsSupport: (agent) => intakeAgentConfig(intake, agent).os_support,
       agentFamily: (agent) =>
         agentRuntimeFamily(intakeAgentConfig(intake, agent)),
@@ -1135,20 +1288,52 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
       registeredBy: args.registeredBy,
       ...(args.estimates === undefined ? {} : { estimates: args.estimates }),
     });
+    const measurement_requirements = resolveMeasurementRequirements({
+      files: intake.files,
+      scenarios: prepared.cells.map((c) => c.scenario),
+      ...(compiledSuite.measurement_requirements
+        ? { reference: compiledSuite.measurement_requirements }
+        : {}),
+    });
     const draft = {
       ...prepared,
+      measurement_requirements,
+      ...(comparisonRequest === undefined
+        ? {}
+        : { comparison_request: comparisonRequest }),
       campaign_id: campaignId,
       input_digest: '0'.repeat(64),
       registered_at: now,
       registered_by: args.registeredBy,
     };
-    return ExperimentSchema.parse({
+    const qualification = evaluateQualification({
+      experiment: draft,
+      files: intake.files,
+      credential: intake.credentials[grader.credential],
+    });
+    const bound = {
       ...draft,
-      input_digest: experimentDigest(draft),
+      ...(qualification ? { assessment_qualification: qualification } : {}),
+    };
+    return ExperimentSchema.parse({
+      ...bound,
+      input_digest: experimentDigest(bound),
     });
   };
 
-  const intake = readSnapshotIntake(args.evalsCheckout, evalsSha, args.runner);
+  const extraPaths = [
+    suite.measurement_requirements?.path,
+    suite.assessment_qualification?.path,
+  ].filter((p): p is string => p !== undefined);
+  const intake = readSnapshotIntake(
+    args.evalsCheckout,
+    evalsSha,
+    args.runner,
+    extraPaths,
+    suite.assessment_qualification,
+  );
+  if (comparisonRequest !== undefined)
+    intake.files[comparisonRequest.suite_path] = args.suiteRaw;
   const staged = compile(intake);
   mkdirSync(args.campaignsRoot, { recursive: true });
   const campaignsRoot = realpathSync(args.campaignsRoot);
@@ -1174,7 +1359,13 @@ export function registerCampaign(args: RegisterArgs): RegisterResult {
       runner: args.runner,
     });
     verifyIntakeMatch(intake, handle.evalsRoot);
-    const experiment = compile(readIntakeFromEvalsTree(handle.evalsRoot));
+    const experiment = compile(
+      readIntakeFromEvalsTree(
+        handle.evalsRoot,
+        extraPaths,
+        suite.assessment_qualification,
+      ),
+    );
     if (experiment.input_digest !== staged.input_digest) {
       throw new RegistrationError(
         `materialized snapshot input digest ${experiment.input_digest} differs from object-store intake ${staged.input_digest}`,

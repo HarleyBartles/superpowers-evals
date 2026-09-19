@@ -14,6 +14,7 @@ import { normalizeAntigravity } from '../normalize/antigravity.ts';
 import { normalizeClaudeLegacy } from '../normalize/claude.ts';
 import { normalizeCline } from '../normalize/cline.ts';
 import { normalizeCodex } from '../normalize/codex.ts';
+import type { AtifNormalizationContext } from '../normalize/context.ts';
 import { normalizeCopilot } from '../normalize/copilot.ts';
 import { normalizeCursor } from '../normalize/cursor.ts';
 import { normalizeGemini } from '../normalize/gemini.ts';
@@ -41,15 +42,18 @@ import { filterLogsByCwd } from './cwd-filter.ts';
 type AtifNormalizer = (
   raw: string,
   version: string,
+  context?: AtifNormalizationContext,
   onMalformedLine?: (line: number, message: string) => void,
 ) => AtifTrajectory;
 
 export const ATIF_NORMALIZERS: Record<string, AtifNormalizer> = {
   acp: normalizeAcp,
   antigravity: normalizeAntigravity,
-  claude: normalizeClaudeLegacy,
+  claude: (raw, version, _context, onMalformedLine) =>
+    normalizeClaudeLegacy(raw, version, onMalformedLine),
   cline: normalizeCline,
-  codex: normalizeCodex,
+  codex: (raw, version, _context, onMalformedLine) =>
+    normalizeCodex(raw, version, onMalformedLine),
   copilot: normalizeCopilot,
   cursor: normalizeCursor,
   gemini: normalizeGemini,
@@ -121,6 +125,9 @@ export interface CaptureArgs {
   // filtered to those whose recorded cwd matches this before normalizing.
   // Other dialects ignore it.
   readonly launchCwd: string;
+  // Facts resolved by the runner's provisioning route. Historical capture and
+  // callers without qualified runtime evidence omit this.
+  readonly normalizationContext?: AtifNormalizationContext | undefined;
 }
 
 // New session logs since the snapshot, narrowed to this run via cwd filtering.
@@ -131,7 +138,8 @@ function capturedLogs(args: CaptureArgs): string[] {
 
 export interface CaptureResult {
   // Path to the emitted ATIF trajectory.json. The file is absent when no
-  // meaningful message or tool evidence was captured.
+  // meaningful message, tool, or usage evidence was captured. A usage-only
+  // trajectory is retained for pricing while availability stays unavailable.
   readonly path: string;
   readonly sourceLogs: readonly string[];
   readonly rowCount: number;
@@ -264,6 +272,7 @@ function mergeTrajectories(perFile: AtifTrajectory[]): AtifTrajectory | null {
 function emitTrajectory(
   sourceLog: string,
   normalize: AtifNormalizer,
+  context: AtifNormalizationContext | undefined,
 ): { trajectory: AtifTrajectory | null; errors: CaptureError[] } {
   let raw: string;
   try {
@@ -282,13 +291,18 @@ function emitTrajectory(
   }
   const errors: CaptureError[] = [];
   try {
-    const trajectory = normalize(raw, ATIF_AGENT_VERSION, (line, message) => {
-      errors.push({
-        sourceLog,
-        stage: 'normalize',
-        message: `line ${line}: ${message}`,
-      });
-    });
+    const trajectory = normalize(
+      raw,
+      ATIF_AGENT_VERSION,
+      context,
+      (line, message) => {
+        errors.push({
+          sourceLog,
+          stage: 'normalize',
+          message: `line ${line}: ${message}`,
+        });
+      },
+    );
     return { trajectory, errors };
   } catch (error) {
     errors.push({
@@ -308,6 +322,14 @@ function hasMeaningfulEvidence(trajectory: AtifTrajectory): boolean {
   );
 }
 
+// Usage remains priceable even when the capture cannot support a verdict.
+function hasUsageEvidence(trajectory: AtifTrajectory): boolean {
+  return (
+    trajectory.final_metrics !== undefined ||
+    trajectory.steps.some((step) => step.metrics !== undefined)
+  );
+}
+
 /**
  * Normalize each new session log into an ATIF trajectory, merge them into one,
  * and write run_dir/trajectory.json.
@@ -316,7 +338,8 @@ function hasMeaningfulEvidence(trajectory: AtifTrajectory): boolean {
  * and merges their steps into a single trajectory ordered by step timestamp (see
  * mergeTrajectories). rowCount remains the number of tool calls in the merged
  * trajectory. A message-only trajectory is retained as available evidence.
- * When there is no meaningful message or tool evidence, any stale
+ * Usage-only evidence is retained for accounting but stays unavailable for a
+ * verdict. When there is no message, tool, or usage evidence, any stale
  * trajectory.json is removed so downstream loaders fail closed.
  */
 export function captureToolCalls(args: CaptureArgs): CaptureResult {
@@ -331,7 +354,7 @@ export function captureToolCalls(args: CaptureArgs): CaptureResult {
   const perFile: AtifTrajectory[] = [];
   const errors: CaptureError[] = [];
   for (const log of newLogs) {
-    const emitted = emitTrajectory(log, normalize);
+    const emitted = emitTrajectory(log, normalize, args.normalizationContext);
     errors.push(...emitted.errors);
     if (emitted.trajectory !== null) {
       perFile.push(emitted.trajectory);
@@ -341,7 +364,8 @@ export function captureToolCalls(args: CaptureArgs): CaptureResult {
   const merged = mergeTrajectories(perFile);
   const rowCount = merged === null ? 0 : flattenToolCalls(merged).length;
   const meaningful = merged !== null && hasMeaningfulEvidence(merged);
-  if (merged !== null && meaningful) {
+  const priceable = merged !== null && hasUsageEvidence(merged);
+  if (merged !== null && (meaningful || priceable)) {
     writeFileSync(outPath, `${JSON.stringify(merged, null, 2)}\n`);
   } else {
     // Unavailable evidence must not leave a stale trajectory behind: a later

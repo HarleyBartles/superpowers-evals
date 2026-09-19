@@ -15,6 +15,7 @@ import {
   cancelCampaign,
   observeCampaignStatus,
 } from '../campaign/cancellation.ts';
+import type { ComparisonInput } from '../campaign/comparison-input.ts';
 import { ContainerAttemptRuntime } from '../campaign/container-spawner.ts';
 import {
   type HostStatsProbe,
@@ -26,12 +27,14 @@ import {
   registerCampaign,
 } from '../campaign/registration.ts';
 import {
-  publishReportSnapshot,
+  deliverComparisonReport,
+  readReportDelivery,
+} from '../campaign/report-delivery.ts';
+import {
   readComparisonReadout,
   readComparisonReport,
 } from '../campaign/report-publication.ts';
 import { resolveCampaignResultsRoot } from '../campaign/results-root.ts';
-import { sealReport } from '../campaign/seal.ts';
 import { getEnv } from '../env.ts';
 import { RealClock } from '../scheduler/clock.ts';
 import { startCampaignOnce } from './campaign-run.ts';
@@ -45,6 +48,7 @@ export interface CampaignCommandArgs {
   json: boolean;
 }
 export interface CampaignRegisterArgs {
+  comparisonInput?: ComparisonInput;
   suite: string;
   globalCap?: number;
   json: boolean;
@@ -179,7 +183,10 @@ export function campaignCommands(deps: CampaignCommandDeps) {
       const globalCap = args.globalCap ?? DEFAULT_GLOBAL_CAP;
       if (!Number.isSafeInteger(globalCap) || globalCap <= 0)
         throw new Error('global cap must be a positive integer');
-      return registerCampaign({
+      const result = registerCampaign({
+        ...(args.comparisonInput === undefined
+          ? {}
+          : { comparisonInput: args.comparisonInput }),
         suitePath: args.suite,
         suiteRaw: readFileSync(args.suite, 'utf8'),
         campaignsRoot: root,
@@ -196,6 +203,29 @@ export function campaignCommands(deps: CampaignCommandDeps) {
         registeredBy: getEnv('USER') ?? 'operator',
         nowMs: Date.now(),
       });
+      const experiment = result.experiment;
+      return {
+        ...result,
+        summary: {
+          comparison_request: experiment.comparison_request,
+          planned_samples: experiment.planned_slots.length,
+          reserve_slots: experiment.reserve_slots.length,
+          coverage: experiment.cells,
+          exclusions: experiment.excluded_cells,
+          effort: experiment.execution_surface.map((arm) => ({
+            arm: arm.name,
+            effort: arm.effort ?? 'provider default',
+          })),
+          global_cap: experiment.contention.global_run_cap,
+          pools: experiment.pool_policy.map((pool) => ({
+            ...pool,
+            effective_max_concurrency: Math.min(
+              experiment.contention.global_run_cap,
+              pool.max_concurrency,
+            ),
+          })),
+        },
+      };
     },
     list() {
       if (!existsSync(root)) return [];
@@ -233,10 +263,18 @@ export function campaignCommands(deps: CampaignCommandDeps) {
       });
     },
     status(args: CampaignCommandArgs) {
-      return observeCampaignStatus(
-        context(args.campaignSelector),
-        deps.processes,
-      );
+      const ctx = context(args.campaignSelector);
+      const status = observeCampaignStatus(ctx, deps.processes);
+      if (
+        status.state === 'registered' ||
+        status.state === 'running' ||
+        status.state === 'unresolved' ||
+        status.state === 'stopping'
+      )
+        return { ...status, delivery: null, report_pending: false };
+      const report = readComparisonReport(ctx, deps.processes);
+      const delivery = readReportDelivery(report);
+      return { ...status, delivery, report_pending: delivery === null };
     },
     run(args: CampaignCommandArgs) {
       return (deps.launch ?? startCampaignOnce)(
@@ -274,16 +312,12 @@ export function campaignCommands(deps: CampaignCommandDeps) {
       ).report.accounting;
     },
     report(args: CampaignCommandArgs) {
-      const ctx = context(args.campaignSelector);
-      const report = readComparisonReport(ctx, deps.processes);
-      if (
-        report.report.status === 'completed' &&
-        report.report.complete &&
-        report.report.termination_verified
-      )
-        sealReport({ campaignDir: ctx.campaignDir, report });
-      else publishReportSnapshot({ campaignDir: ctx.campaignDir, report });
-      return report;
+      const { report, delivery } = deliverComparisonReport({
+        ...context(args.campaignSelector),
+        processes: deps.processes,
+        now: Date.now,
+      });
+      return { ...report, delivery };
     },
   };
 }
